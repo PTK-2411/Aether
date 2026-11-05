@@ -1035,13 +1035,6 @@ impl BrowserApp {
                     if ui.add(egui::Link::new(RichText::new("Architecture").size(13.0).color(Color32::from_rgb(232, 234, 237)))).clicked() {
                         self.navigate_active_tab("about:credits");
                     }
-
-                    ui.add_space(8.0);
-
-                    // Aether AI link
-                    if ui.add(egui::Link::new(RichText::new("✦ Aether AI").size(13.0).color(Color32::from_rgb(168, 199, 250)))).clicked() {
-                        self.navigate_active_tab("about:ai");
-                    }
                 });
             });
 
@@ -1066,14 +1059,7 @@ impl BrowserApp {
                             .color(Color32::WHITE),
                     );
                 });
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new("100% Pure Rust Web Browser • Zero Chromium")
-                        .size(13.0)
-                        .color(Color32::from_rgb(154, 160, 166)),
-                );
-
-                ui.add_space(24.0);
+                ui.add_space(28.0);
 
                 // 2. Center Search Bar (Large Pill Shape ~680px wide)
                 let search_box_width = (680.0_f32).min(ui.available_width() - 32.0);
@@ -1095,7 +1081,7 @@ impl BrowserApp {
                 inner_ui.add_space(10.0);
 
                 // Text Edit: "Search with Aether or type a URL"
-                let input_width = inner_ui.available_width() - 175.0;
+                let input_width = inner_ui.available_width() - 65.0;
                 let center_edit = inner_ui.add_sized(
                     Vec2::new(input_width.max(100.0), 30.0),
                     egui::TextEdit::singleline(&mut self.center_search_input)
@@ -1120,38 +1106,19 @@ impl BrowserApp {
                     }
                 }
 
-                // Right icons inside Search Bar: Mic, Lens/Camera, AI Mode (All Vector drawn)
+                // Right icons inside Search Bar: Mic, Lens/Camera (Vector drawn)
                 inner_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |inner_ui| {
-                    let ai_btn = inner_ui.add(
-                        egui::Button::new(
-                            RichText::new("✦ AI Mode")
-                                .size(12.0)
-                                .color(Color32::from_rgb(168, 199, 250)),
-                        )
-                        .fill(Color32::from_rgb(55, 57, 60))
-                        .corner_radius(14)
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(95, 99, 104))),
-                    );
-                    if ai_btn.clicked() {
-                        self.navigate_active_tab("about:ai");
-                    }
-
-                    inner_ui.add_space(8.0);
-
                     // Camera / Lens icon (Vector drawn)
-                    let (cam_rect, cam_resp) = inner_ui.allocate_exact_size(Vec2::new(20.0, 20.0), egui::Sense::click());
+                    let (cam_rect, _cam_resp) = inner_ui.allocate_exact_size(Vec2::new(20.0, 20.0), egui::Sense::hover());
                     let cc = cam_rect.center();
                     let cam_box = egui::Rect::from_center_size(cc, Vec2::new(14.0, 10.0));
                     inner_ui.painter().rect_stroke(cam_box, 2.0_f32, Stroke::new(1.2_f32, Color32::from_rgb(180, 185, 190)), StrokeKind::Inside);
                     inner_ui.painter().circle_stroke(cc, 2.5, Stroke::new(1.2_f32, Color32::from_rgb(180, 185, 190)));
-                    if cam_resp.clicked() {
-                        self.navigate_active_tab("about:ai");
-                    }
 
                     inner_ui.add_space(8.0);
 
                     // Microphone icon (Vector drawn)
-                    let (mic_rect, _mic_resp) = inner_ui.allocate_exact_size(Vec2::new(20.0, 20.0), egui::Sense::click());
+                    let (mic_rect, _mic_resp) = inner_ui.allocate_exact_size(Vec2::new(20.0, 20.0), egui::Sense::hover());
                     let mc = mic_rect.center();
                     let mic_body = egui::Rect::from_center_size(Pos2::new(mc.x, mc.y - 2.0), Vec2::new(6.0, 9.0));
                     inner_ui.painter().rect_filled(mic_body, 3.0, Color32::from_rgb(180, 185, 190));
