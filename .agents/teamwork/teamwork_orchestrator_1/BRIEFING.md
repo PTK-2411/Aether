@@ -1,4 +1,4 @@
-# BRIEFING — 2026-11-05T06:04:00Z
+# BRIEFING — 2026-11-05T06:11:00Z
 
 ## Mission
 Clean up and refine Rust browser UI and search behavior for production use, routing web searches to Google, changing profile pill to Login, and removing subtitle text, action chips, and AI-related buttons across the interface.
@@ -24,11 +24,12 @@ Clean up and refine Rust browser UI and search behavior for production use, rout
    - Escalate: report to parent (sub-orchestrators only, last resort)
 4. **Succession**: At 16 spawns, write soft handoff.md, cancel crons, spawn successor.
 - **Work items**:
-  1. Survey and Scope Mapping [in-progress]
-  2. Implementation of UI cleanup & search navigation [pending]
-  3. Verification and Audit [pending]
-- **Current phase**: 0 (Survey)
-- **Current focus**: Surveying codebase and requirements with 3 Explorers
+  1. Survey and Scope Mapping [done]
+  2. M1 Fix Strategy Exploration [in-progress]
+  3. M1 Worker Implementation [pending]
+  4. M1 Verification (Reviewers, Challengers, Auditor) [pending]
+- **Current phase**: 2B.a (Iteration 1 Exploration)
+- **Current focus**: Milestone M1 fix strategy exploration with 3 Explorers
 
 ## 🔒 Key Constraints
 - NEVER write, modify, or create source code files directly.
@@ -44,20 +45,24 @@ Clean up and refine Rust browser UI and search behavior for production use, rout
 - Updated: not yet
 
 ## Key Decisions Made
-- Project classified as SWE / Project Pattern.
-- Dispatched 3 parallel survey explorers for Phase 0 to map requirements and code structure.
+- Phase 0 Survey completed by 3 Explorers and synthesized into PROJECT.md.
+- Assessed scope as fitting single iteration loop (2B).
+- Dispatched 3 M1 Explorers to produce exact implementation blueprints for Worker.
 
 ## Team Roster
 | Agent | Type | Work Item | Status | Conv ID |
 |-------|------|-----------|--------|---------|
-| survey_explorer_1 | teamwork_explorer | Search Navigation survey | in-progress | 91cca62d-2fdf-4293-b416-bbc92a4386c5 |
-| survey_explorer_2 | teamwork_explorer | Header & New Tab Simplification survey | in-progress | fbac13af-9cf3-4819-ac68-eb6be3b5601f |
-| survey_explorer_3 | teamwork_explorer | AI UI Elements & /graphify survey | in-progress | 7bcd600f-3ccd-470c-93d1-5978bcb5de6b |
+| survey_explorer_1 | teamwork_explorer | Search Navigation survey | completed | 91cca62d-2fdf-4293-b416-bbc92a4386c5 |
+| survey_explorer_2 | teamwork_explorer | Header & New Tab Simplification survey | completed | fbac13af-9cf3-4819-ac68-eb6be3b5601f |
+| survey_explorer_3 | teamwork_explorer | AI UI Elements & /graphify survey | completed | 7bcd600f-3ccd-470c-93d1-5978bcb5de6b |
+| m1_explorer_1 | teamwork_explorer | M1 Search Navigation fix strategy | in-progress | e94370e1-a634-469b-a314-ae65879fb7e3 |
+| m1_explorer_2 | teamwork_explorer | M1 Header & New Tab fix strategy | in-progress | de4bfc0d-b66a-4b2a-b41f-a32a048bc30c |
+| m1_explorer_3 | teamwork_explorer | M1 AI Elements removal fix strategy | in-progress | 8035e354-a326-4f0c-8023-c9f30979932f |
 
 ## Succession Status
 - Succession required: no
-- Spawn count: 3 / 16
-- Pending subagents: 91cca62d-2fdf-4293-b416-bbc92a4386c5, fbac13af-9cf3-4819-ac68-eb6be3b5601f, 7bcd600f-3ccd-470c-93d1-5978bcb5de6b
+- Spawn count: 6 / 16
+- Pending subagents: e94370e1-a634-469b-a314-ae65879fb7e3, de4bfc0d-b66a-4b2a-b41f-a32a048bc30c, 8035e354-a326-4f0c-8023-c9f30979932f
 - Predecessor: none
 - Successor: not yet spawned
 
@@ -71,3 +76,4 @@ Clean up and refine Rust browser UI and search behavior for production use, rout
 - /home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/ORIGINAL_REQUEST.md — Original user request
 - /home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_orchestrator_1/DISPATCH.md — Dispatch assignment from parent
 - /home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_orchestrator_1/progress.md — Liveness & iteration status
+- /home/ptk/Documents/Projects/Rust-browser/PROJECT.md — Global architecture, feature inventory, milestones
