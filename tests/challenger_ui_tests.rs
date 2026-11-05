@@ -5,7 +5,6 @@ use rust_browser::network::normalize_url;
 fn test_browser_app_lifecycle_and_navigation() {
     let mut app = BrowserApp::new();
 
-    // Verify initial tab is newtab
     // Trigger navigation via active tab
     app.navigate_active_tab("rust programming language");
 
@@ -73,5 +72,95 @@ fn test_omnibox_and_searchbox_textedit_resilience() {
         let input_width = inner_w - 65.0;
         let actual_edit_w = input_width.max(100.0);
         assert!(actual_edit_w >= 100.0);
+    }
+}
+
+#[test]
+fn test_empirical_source_invariants_in_app_rs() {
+    let source = std::fs::read_to_string("src/app.rs")
+        .expect("Failed to read src/app.rs");
+
+    // 1. Omnibox AI Mode absence
+    assert!(
+        !source.contains("✦ AI Mode"),
+        "Found '✦ AI Mode' still present in src/app.rs!"
+    );
+
+    // 2. Profile pill: 'Hi, Khoa' absence
+    assert!(
+        !source.contains("Hi, Khoa"),
+        "Found 'Hi, Khoa' still present in src/app.rs!"
+    );
+
+    // 3. New Tab Subtitle absence
+    assert!(
+        !source.contains("100% Pure Rust Web Browser • Zero Chromium"),
+        "Found '100% Pure Rust Web Browser • Zero Chromium' still present in src/app.rs!"
+    );
+
+    // 4. Action chips absence
+    assert!(
+        !source.contains("Aether AI Assistant"),
+        "Found 'Aether AI Assistant' still present in src/app.rs!"
+    );
+    assert!(
+        !source.contains("Explore Open Web"),
+        "Found 'Explore Open Web' still present in src/app.rs!"
+    );
+
+    // 5. Header AI link absence
+    assert!(
+        !source.contains("✦ Aether AI"),
+        "Found '✦ Aether AI' link still present in src/app.rs!"
+    );
+
+    // 6. Login pill invariants:
+    // - Size Vec2::new(64.0, 28.0)
+    assert!(
+        source.contains("Vec2::new(64.0, 28.0)"),
+        "Login pill does not allocate exact size 64.0 x 28.0"
+    );
+    // - Centered text 'Login'
+    assert!(
+        source.contains("\"Login\""),
+        "Login label missing in src/app.rs"
+    );
+    assert!(
+        source.contains("https://accounts.google.com"),
+        "Login button does not navigate to https://accounts.google.com"
+    );
+
+    // 7. Shortcut row invariants:
+    // - total_shortcuts_w = 6.0 * 68.0
+    assert!(
+        source.contains("let total_shortcuts_w = 6.0 * 68.0;"),
+        "Shortcuts row width must be 6.0 * 68.0"
+    );
+
+    // 8. Omnibox width utilization:
+    // available_edit_w must be child_ui.available_width()
+    assert!(
+        source.contains("let available_edit_w = child_ui.available_width();"),
+        "Omnibox edit field must utilize full available_width()"
+    );
+}
+
+#[test]
+fn test_autocomplete_delegation_matrix() {
+    let test_cases = vec![
+        ("rust borrow checker", "https://www.google.com/search?q=rust+borrow+checker"),
+        ("wikipedia", "https://www.google.com/search?q=wikipedia"),
+        ("crates.io", "https://crates.io"),
+        ("news.ycombinator.com", "https://news.ycombinator.com"),
+        ("https://github.com/rust-lang", "https://github.com/rust-lang"),
+        ("about:credits", "about:credits"),
+        ("about:test", "about:test"),
+        ("localhost:3000", "http://localhost:3000"),
+        ("127.0.0.1:8080", "https://127.0.0.1:8080"),
+    ];
+
+    for (query, expected_nav) in test_cases {
+        let normalized = normalize_url(query);
+        assert_eq!(normalized, expected_nav, "Query '{}' did not route to expected target", query);
     }
 }

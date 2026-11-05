@@ -278,3 +278,34 @@ fn test_fuzz_and_invariant_stress() {
         }
     }
 }
+
+#[test]
+fn test_network_manager_search_fetch() {
+    use rust_browser::network::{NetworkManager, NetworkMessage};
+    use std::time::{Duration, Instant};
+
+    let net = NetworkManager::new();
+    // Fetch a raw search query (which should be normalized to Google Search and intercepted)
+    net.fetch(42, "rust programming language");
+
+    let start = Instant::now();
+    let mut received = None;
+    while start.elapsed() < Duration::from_secs(5) {
+        if let Some(msg) = net.try_recv() {
+            received = Some(msg);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(received.is_some(), "NetworkManager timed out waiting for search page response");
+    match received.unwrap() {
+        NetworkMessage::PageLoaded { tab_id, result } => {
+            assert_eq!(tab_id, 42);
+            let page = result.expect("Search page fetch should succeed");
+            assert!(page.url.starts_with("https://www.google.com/search?q="));
+            assert!(page.title.contains("Google Search"));
+            assert!(page.html.contains("Google Search"));
+        }
+    }
+}
