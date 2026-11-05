@@ -8,6 +8,10 @@ pub struct PageResponse {
     pub url: String,
     pub html: String,
     pub title: String,
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    pub duration_ms: u64,
 }
 
 pub enum NetworkMessage {
@@ -166,6 +170,10 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
             url: "about:newtab".to_string(),
             html: WELCOME_HTML.to_string(),
             title: "New Tab".to_string(),
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
+            duration_ms: 1,
         });
     }
 
@@ -174,6 +182,10 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
             url: "about:ai".to_string(),
             html: AI_MODE_HTML.to_string(),
             title: "Aether AI Mode".to_string(),
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
+            duration_ms: 1,
         });
     }
 
@@ -182,6 +194,10 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
             url: url_str.to_string(),
             html: TEST_SUITE_HTML.to_string(),
             title: "CSS & DOM Test Suite".to_string(),
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
+            duration_ms: 1,
         });
     }
 
@@ -190,6 +206,10 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
             url: url_str.to_string(),
             html: CREDITS_HTML.to_string(),
             title: "Credits & Engine Architecture".to_string(),
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
+            duration_ms: 1,
         });
     }
 
@@ -198,6 +218,10 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
             url: url_str.to_string(),
             html: "<html><body></body></html>".to_string(),
             title: "Blank Tab".to_string(),
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
+            duration_ms: 1,
         });
     }
 
@@ -208,6 +232,10 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
                     url: url_str.to_string(),
                     title: file_path.to_string(),
                     html: content,
+                    status: 200,
+                    status_text: "OK".to_string(),
+                    headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
+                    duration_ms: 1,
                 });
             }
             Err(e) => {
@@ -228,6 +256,7 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
     }
 
     // HTTP / HTTPS fetching via reqwest
+    let start_time = std::time::Instant::now();
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Aether/1.0")
         .timeout(std::time::Duration::from_secs(12))
@@ -240,8 +269,16 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         .header("Accept-Language", "en-US,en;q=0.9,vi;q=0.8")
         .send()
         .map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
     let final_url = response.url().to_string();
     let body = response.text().map_err(|e| e.to_string())?;
+    let duration_ms = start_time.elapsed().as_millis() as u64;
 
     let title = extract_title_or(&body, &final_url);
 
@@ -273,6 +310,10 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         url: final_url,
         html: final_html,
         title,
+        status,
+        status_text,
+        headers,
+        duration_ms,
     })
 }
 
@@ -517,6 +558,10 @@ fn generate_aether_search_results(query: &str, url_str: &str) -> PageResponse {
         url: url_str.to_string(),
         html,
         title: format!("{} - Google Search", query),
+        status: 200,
+        status_text: "OK".to_string(),
+        headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
+        duration_ms: 15,
     }
 }
 

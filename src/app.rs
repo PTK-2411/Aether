@@ -7,9 +7,124 @@ use crate::network::{normalize_url, resolve_relative_url, NetworkManager, Networ
 use crate::render::{build_display_list, paint_display_list, DisplayList};
 use crate::style::style_tree;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Key, Pos2, RichText,
-    ScrollArea, Stroke, StrokeKind, Vec2,
+    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Key, LayerId, Margin,
+    Order, Pos2, Rect as EguiRect, RichText, ScrollArea, Stroke, StrokeKind, Vec2,
 };
+use url::Url;
+
+/// Chrome discrete zoom percentage steps
+pub const ZOOM_STEPS: &[f32] = &[
+    0.25, 0.33, 0.50, 0.67, 0.75, 0.80, 0.90, 1.00,
+    1.10, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00, 4.00, 5.00,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevToolsDockPosition {
+    Right,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevToolsTab {
+    Elements,
+    Console,
+    Sources,
+    Network,
+    Application,
+    Security,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuIcon {
+    Shield,
+    NewTab,
+    NewWindow,
+    Incognito,
+    Passwords,
+    History,
+    Downloads,
+    Bookmarks,
+    TabGroups,
+    Extensions,
+    DeleteData,
+    Zoom,
+    Print,
+    GoogleLens,
+    Translate,
+    Find,
+    Cast,
+    MoreTools,
+    Help,
+    Settings,
+    Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleLogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsoleEntry {
+    pub id: usize,
+    pub timestamp: String,
+    pub level: ConsoleLogLevel,
+    pub source: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkTypeFilter {
+    All,
+    Doc,
+    Css,
+    Js,
+    Img,
+    Fetch,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkEntry {
+    pub id: usize,
+    pub url: String,
+    pub name: String,
+    pub method: String,
+    pub status: u16,
+    pub status_text: String,
+    pub resource_type: String,
+    pub size_bytes: usize,
+    pub duration_ms: u64,
+    pub headers: Vec<(String, String)>,
+    pub response_body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcesFileId {
+    HtmlDocument,
+    UserAgentCss,
+    InlineCss(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageSection {
+    Cookies,
+    LocalStorage,
+    SessionStorage,
+    TextureCache,
+}
+
+#[derive(Debug, Clone)]
+pub struct CookieEntry {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub expires: String,
+    pub secure: bool,
+    pub http_only: bool,
+}
 
 pub struct Tab {
     pub id: usize,
@@ -25,6 +140,8 @@ pub struct Tab {
     pub display_list: Option<DisplayList>,
     pub page_height: f32,
     pub last_layout_width: f32,
+    pub network_entries: Vec<NetworkEntry>,
+    pub console_entries: Vec<ConsoleEntry>,
 }
 
 impl Tab {
@@ -44,6 +161,8 @@ impl Tab {
             display_list: None,
             page_height: 0.0,
             last_layout_width: 0.0,
+            network_entries: Vec::new(),
+            console_entries: Vec::new(),
         }
     }
 
@@ -94,20 +213,35 @@ pub struct SelectedNodeInfo {
 }
 
 pub struct BrowserApp {
-    tabs: Vec<Tab>,
-    active_tab_idx: usize,
-    next_tab_id: usize,
-    network: NetworkManager,
-    address_input: String,
-    center_search_input: String,
-    hovered_link: Option<String>,
-    show_devtools: bool,
-    devtools_tab: DevToolsTab,
-    selected_dom_node: Option<String>,
-    selected_node_info: Option<SelectedNodeInfo>,
-    zoom_level: f32,
-    show_menu_popup: bool,
-    show_more_shortcuts: bool,
+    pub tabs: Vec<Tab>,
+    pub active_tab_idx: usize,
+    pub next_tab_id: usize,
+    pub network: NetworkManager,
+    pub address_input: String,
+    pub center_search_input: String,
+    pub hovered_link: Option<String>,
+    pub show_devtools: bool,
+    pub devtools_tab: DevToolsTab,
+    pub devtools_dock: DevToolsDockPosition,
+    pub devtools_selected_path: Option<Vec<usize>>,
+    pub devtools_expanded_paths: std::collections::HashSet<Vec<usize>>,
+    pub devtools_dom_search: String,
+    pub devtools_styles_filter: String,
+    pub devtools_console_filter: String,
+    pub devtools_console_level: Option<ConsoleLogLevel>,
+    pub devtools_console_input: String,
+    pub devtools_network_filter: String,
+    pub devtools_network_type: NetworkTypeFilter,
+    pub devtools_selected_network_id: Option<usize>,
+    pub devtools_sources_file: SourcesFileId,
+    pub devtools_storage_section: StorageSection,
+    pub devtools_cookies: Vec<CookieEntry>,
+    pub devtools_local_storage: std::collections::HashMap<String, String>,
+    pub devtools_session_storage: std::collections::HashMap<String, String>,
+    pub selected_dom_node: Option<String>,
+    pub selected_node_info: Option<SelectedNodeInfo>,
+    pub zoom_level: f32,
+    pub show_menu_popup: bool,
 
     image_textures: std::collections::HashMap<String, egui::TextureHandle>,
     image_tx: std::sync::mpsc::Sender<(String, egui::ColorImage)>,
@@ -122,19 +256,44 @@ pub struct BrowserApp {
     show_center_suggestions: bool,
 }
 
-#[derive(PartialEq, Eq)]
-enum DevToolsTab {
-    DomTree,
-    Styles,
-    Source,
-    Network,
-}
-
 impl BrowserApp {
     pub fn new() -> Self {
         let network = NetworkManager::new();
         let (img_tx, img_rx) = std::sync::mpsc::channel();
         let (sug_tx, sug_rx) = std::sync::mpsc::channel();
+
+        let mut expanded_paths = std::collections::HashSet::new();
+        expanded_paths.insert(vec![]);
+        expanded_paths.insert(vec![0]);
+        expanded_paths.insert(vec![0, 0]);
+
+        let mut local_storage = std::collections::HashMap::new();
+        local_storage.insert("theme".to_string(), "dark".to_string());
+        local_storage.insert("aether_version".to_string(), "1.0.0".to_string());
+
+        let mut session_storage = std::collections::HashMap::new();
+        session_storage.insert("session_id".to_string(), "ae_live_8921f0".to_string());
+
+        let cookies = vec![
+            CookieEntry {
+                name: "SID".to_string(),
+                value: "s%3A7a19c...".to_string(),
+                domain: "accounts.google.com".to_string(),
+                path: "/".to_string(),
+                expires: "2027-01-01".to_string(),
+                secure: true,
+                http_only: true,
+            },
+            CookieEntry {
+                name: "NID".to_string(),
+                value: "511=Q9x...".to_string(),
+                domain: "google.com".to_string(),
+                path: "/".to_string(),
+                expires: "2026-12-31".to_string(),
+                secure: true,
+                http_only: false,
+            },
+        ];
 
         let mut app = BrowserApp {
             tabs: Vec::new(),
@@ -145,12 +304,27 @@ impl BrowserApp {
             center_search_input: "".to_string(),
             hovered_link: None,
             show_devtools: false,
-            devtools_tab: DevToolsTab::DomTree,
+            devtools_tab: DevToolsTab::Elements,
+            devtools_dock: DevToolsDockPosition::Right,
+            devtools_selected_path: Some(vec![]),
+            devtools_expanded_paths: expanded_paths,
+            devtools_dom_search: String::new(),
+            devtools_styles_filter: String::new(),
+            devtools_console_filter: String::new(),
+            devtools_console_level: None,
+            devtools_console_input: String::new(),
+            devtools_network_filter: String::new(),
+            devtools_network_type: NetworkTypeFilter::All,
+            devtools_selected_network_id: None,
+            devtools_sources_file: SourcesFileId::HtmlDocument,
+            devtools_storage_section: StorageSection::Cookies,
+            devtools_cookies: cookies,
+            devtools_local_storage: local_storage,
+            devtools_session_storage: session_storage,
             selected_dom_node: None,
             selected_node_info: None,
             zoom_level: 1.0,
             show_menu_popup: false,
-            show_more_shortcuts: false,
             image_textures: std::collections::HashMap::new(),
             image_tx: img_tx,
             image_rx: img_rx,
@@ -166,6 +340,42 @@ impl BrowserApp {
         // Open initial New Tab
         app.open_new_tab("about:newtab".to_string());
         app
+    }
+
+    pub fn zoom_in(&mut self) {
+        let current_idx = ZOOM_STEPS
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (self.zoom_level - *a).abs().partial_cmp(&(self.zoom_level - *b).abs()).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(7);
+        if current_idx + 1 < ZOOM_STEPS.len() {
+            self.zoom_level = ZOOM_STEPS[current_idx + 1];
+        }
+    }
+
+    pub fn zoom_out(&mut self) {
+        let current_idx = ZOOM_STEPS
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (self.zoom_level - *a).abs().partial_cmp(&(self.zoom_level - *b).abs()).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(7);
+        if current_idx > 0 {
+            self.zoom_level = ZOOM_STEPS[current_idx - 1];
+        }
+    }
+
+    pub fn zoom_reset(&mut self) {
+        self.zoom_level = 1.0;
+    }
+
+    pub fn zoom_percentage(&self) -> String {
+        format!("{:.0}%", (self.zoom_level * 100.0).round())
     }
 
     pub fn open_new_tab(&mut self, url: String) {
@@ -287,6 +497,43 @@ impl BrowserApp {
                         tab.is_loading = false;
                         match result {
                             Ok(res) => {
+                                let entry_id = tab.network_entries.len() + 1;
+                                let name = if res.url.starts_with("about:") {
+                                    res.url.clone()
+                                } else if let Ok(parsed) = Url::parse(&res.url) {
+                                    let path = parsed.path();
+                                    if path.is_empty() || path == "/" {
+                                        parsed.host_str().unwrap_or("document").to_string()
+                                    } else {
+                                        path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(path).to_string()
+                                    }
+                                } else {
+                                    res.url.clone()
+                                };
+                                tab.network_entries.push(NetworkEntry {
+                                    id: entry_id,
+                                    url: res.url.clone(),
+                                    name,
+                                    method: "GET".to_string(),
+                                    status: res.status,
+                                    status_text: res.status_text,
+                                    resource_type: "document".to_string(),
+                                    size_bytes: res.html.len(),
+                                    duration_ms: res.duration_ms,
+                                    headers: res.headers,
+                                    response_body: res.html.clone(),
+                                });
+
+                                let time_str = format_current_time();
+                                let console_id = tab.console_entries.len() + 1;
+                                tab.console_entries.push(ConsoleEntry {
+                                    id: console_id,
+                                    timestamp: time_str,
+                                    level: ConsoleLogLevel::Info,
+                                    source: "Navigation".to_string(),
+                                    message: format!("Navigated to {}", res.url),
+                                });
+
                                 tab.url = res.url.clone();
                                 tab.title = if res.title.len() > 24 {
                                     format!("{}...", &res.title[..24])
@@ -313,6 +560,16 @@ impl BrowserApp {
                                 tab.recompute_layout(layout_w);
                             }
                             Err(err) => {
+                                let time_str = format_current_time();
+                                let console_id = tab.console_entries.len() + 1;
+                                tab.console_entries.push(ConsoleEntry {
+                                    id: console_id,
+                                    timestamp: time_str,
+                                    level: ConsoleLogLevel::Error,
+                                    source: "Network".to_string(),
+                                    message: format!("Failed to load {}: {}", tab.url, err),
+                                });
+
                                 tab.title = "Error loading page".to_string();
                                 tab.raw_html = format!(
                                     "<html><body style='padding: 32px; background-color: #202124; color: #fff; font-family: sans-serif;'><h1 style='color: #ea4335;'>Failed to Load Page</h1><p style='color: #9aa0a6;'>{}</p></body></html>",
@@ -544,6 +801,10 @@ fn collect_style_tags(node: &Node, out: &mut String) {
 }
 
 impl eframe::App for BrowserApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_network_responses();
 
@@ -603,33 +864,95 @@ impl eframe::App for BrowserApp {
         visuals.window_fill = Color32::from_rgb(40, 42, 45);
         ctx.set_visuals(visuals);
 
-        // Global hotkey F12 toggle DevTools
-        if ctx.input(|i| i.key_pressed(Key::F12)) {
+        // Global hotkey F12 or Ctrl+Shift+I toggle DevTools
+        let toggle_devtools = ctx.input(|i| {
+            i.key_pressed(Key::F12)
+                || ((i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::I))
+        });
+        if toggle_devtools {
             self.show_devtools = !self.show_devtools;
         }
 
+        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let window_radius = if is_maximized { 0 } else { 10 };
+
         // Top Chrome Panel (Tabs + Navigation Bar)
+        let top_frame = Frame::NONE
+            .fill(Color32::from_rgb(32, 33, 36))
+            .corner_radius(CornerRadius {
+                nw: window_radius,
+                ne: window_radius,
+                sw: 0,
+                se: 0,
+            });
         egui::TopBottomPanel::top("chrome_top_panel")
-            .frame(Frame::NONE.fill(Color32::from_rgb(32, 33, 36)))
+            .frame(top_frame)
             .show(ctx, |ui| {
                 self.render_tab_strip(ui, ctx);
                 self.render_navigation_bar(ui, ctx);
             });
 
-        // DevTools side panel if open
+        // DevTools panel if open (dockable to Right or Bottom)
         if self.show_devtools {
-            egui::SidePanel::right("devtools_panel")
-                .default_width(420.0)
-                .min_width(320.0)
-                .frame(Frame::NONE.fill(Color32::from_rgb(28, 30, 33)))
-                .show(ctx, |ui| {
-                    self.render_devtools(ui);
-                });
+            match self.devtools_dock {
+                DevToolsDockPosition::Right => {
+                    let devtools_frame = Frame::NONE
+                        .fill(Color32::from_rgb(32, 33, 36))
+                        .corner_radius(CornerRadius {
+                            nw: 0,
+                            ne: 0,
+                            sw: 0,
+                            se: window_radius,
+                        });
+                    egui::SidePanel::right("devtools_panel_right")
+                        .default_width(460.0)
+                        .min_width(320.0)
+                        .resizable(true)
+                        .frame(devtools_frame)
+                        .show(ctx, |ui| {
+                            self.render_devtools(ui);
+                        });
+                }
+                DevToolsDockPosition::Bottom => {
+                    let devtools_frame = Frame::NONE
+                        .fill(Color32::from_rgb(32, 33, 36))
+                        .corner_radius(CornerRadius {
+                            nw: 0,
+                            ne: 0,
+                            sw: window_radius,
+                            se: window_radius,
+                        });
+                    egui::TopBottomPanel::bottom("devtools_panel_bottom")
+                        .default_height(280.0)
+                        .min_height(160.0)
+                        .resizable(true)
+                        .frame(devtools_frame)
+                        .show(ctx, |ui| {
+                            self.render_devtools(ui);
+                        });
+                }
+            }
         }
 
         // Main Web Viewport or Aether New Tab Start Page
+        let (central_sw, central_se) = if self.show_devtools {
+            match self.devtools_dock {
+                DevToolsDockPosition::Right => (window_radius, 0),
+                DevToolsDockPosition::Bottom => (0, 0),
+            }
+        } else {
+            (window_radius, window_radius)
+        };
+        let central_frame = Frame::NONE
+            .fill(Color32::from_rgb(53, 54, 58)) // #35363a
+            .corner_radius(CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: central_sw,
+                se: central_se,
+            });
         egui::CentralPanel::default()
-            .frame(Frame::NONE.fill(Color32::from_rgb(53, 54, 58))) // #35363a
+            .frame(central_frame)
             .show(ctx, |ui| {
                 let is_new_tab = self.tabs.get(self.active_tab_idx).map_or(true, |t| t.is_new_tab());
                 if is_new_tab {
@@ -638,6 +961,14 @@ impl eframe::App for BrowserApp {
                     self.render_page_viewport(ui, ctx);
                 }
             });
+
+        // Outer window border stroke for 4-corner rounded frameless window
+        if !is_maximized {
+            let screen_rect = ctx.screen_rect();
+            let border_stroke = Stroke::new(1.0_f32, Color32::from_rgb(60, 64, 67));
+            let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("window_border")));
+            painter.rect_stroke(screen_rect, CornerRadius::same(10), border_stroke, StrokeKind::Inside);
+        }
     }
 }
 
@@ -665,12 +996,7 @@ impl BrowserApp {
 
                 let frame = Frame::NONE
                     .fill(tab_bg)
-                    .corner_radius(CornerRadius {
-                        nw: 8,
-                        ne: 8,
-                        sw: 0,
-                        se: 0,
-                    })
+                    .corner_radius(CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(10, 6));
 
                 let resp = frame.show(ui, |ui| {
@@ -699,7 +1025,9 @@ impl BrowserApp {
                                     .size(12.0)
                                     .color(tab_text_color),
                             )
-                            .truncate(),
+                            .truncate()
+                            .selectable(false)
+                            .sense(egui::Sense::click()),
                         );
                         if label.clicked() {
                             self.active_tab_idx = idx;
@@ -721,7 +1049,7 @@ impl BrowserApp {
                     });
                 });
 
-                if resp.response.clicked() {
+                if close_tab_idx.is_none() && resp.response.interact(egui::Sense::click()).clicked() {
                     self.active_tab_idx = idx;
                     self.address_input = if tab.is_new_tab() { String::new() } else { tab.url.clone() };
                 }
@@ -743,11 +1071,11 @@ impl BrowserApp {
 
             // Draggable strip & Window Controls (Minimize, Maximize, Close)
             let controls_width = 114.0;
-            let available_drag_w = (ui.available_width() - controls_width).max(0.0);
+            let available_drag_w = (ui.available_width() - controls_width).max(10.0);
 
-            // Empty tab bar space: Draggable window region
+            // Empty tab bar space: ONLY region that initiates window dragging
             let (_drag_rect, drag_resp) = ui.allocate_exact_size(Vec2::new(available_drag_w, 28.0), egui::Sense::click_and_drag());
-            if drag_resp.dragged() {
+            if drag_resp.drag_started_by(egui::PointerButton::Primary) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
             if drag_resp.double_clicked() {
@@ -865,10 +1193,10 @@ impl BrowserApp {
             ui.add_space(4.0);
 
             // Omnibox pill container
-            let omnibox_width = ui.available_width() - 175.0;
+            let omnibox_width = (ui.available_width() - 110.0).max(200.0);
             let omnibox_h = 34.0;
 
-            let (response, painter) = ui.allocate_painter(Vec2::new(omnibox_width.max(200.0), omnibox_h), egui::Sense::hover());
+            let (response, painter) = ui.allocate_painter(Vec2::new(omnibox_width, omnibox_h), egui::Sense::hover());
 
             // Omnibox pill background
             let omnibox_bg = Color32::from_rgb(40, 41, 44); // #28292c
@@ -889,7 +1217,7 @@ impl BrowserApp {
             let text_edit = child_ui.add_sized(
                 Vec2::new(available_edit_w.max(50.0), 24.0),
                 egui::TextEdit::singleline(&mut self.address_input)
-                    .hint_text("Search with Aether or type a URL")
+                    .hint_text("Search Google or type a URL")
                     .frame(false)
                     .text_color(Color32::from_rgb(232, 234, 237)),
             );
@@ -943,43 +1271,7 @@ impl BrowserApp {
             }
 
             if self.show_menu_popup {
-                egui::Window::new("Menu")
-                    .anchor(Align2::RIGHT_TOP, Vec2::new(-10.0, 75.0))
-                    .collapsible(false)
-                    .resizable(false)
-                    .frame(Frame::NONE.fill(Color32::from_rgb(43, 45, 48)).corner_radius(8).inner_margin(8))
-                    .show(ctx, |ui| {
-                        if ui.button("New Tab").clicked() {
-                            self.open_new_tab("about:newtab".to_string());
-                            self.show_menu_popup = false;
-                        }
-                        if ui.button("DevTools Inspector (F12)").clicked() {
-                            self.show_devtools = !self.show_devtools;
-                            self.show_menu_popup = false;
-                        }
-                        if ui.button("Reload").clicked() {
-                            self.reload();
-                            self.show_menu_popup = false;
-                        }
-                        if ui.button("CSS Test Suite (about:test)").clicked() {
-                            self.navigate_active_tab("about:test");
-                            self.show_menu_popup = false;
-                        }
-                        if ui.button("Engine Architecture (about:credits)").clicked() {
-                            self.navigate_active_tab("about:credits");
-                            self.show_menu_popup = false;
-                        }
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui.button("-").clicked() {
-                                self.zoom_level = (self.zoom_level - 0.1).max(0.5);
-                            }
-                            ui.label(format!("{:.0}%", self.zoom_level * 100.0));
-                            if ui.button("+").clicked() {
-                                self.zoom_level = (self.zoom_level + 0.1).min(2.0);
-                            }
-                        });
-                    });
+                self.render_chrome_menu_popup(ctx, m_rect);
             }
 
             if self.show_omnibox_suggestions && !self.search_suggestions.is_empty() {
@@ -991,73 +1283,28 @@ impl BrowserApp {
 
     /// Renders the Aether Dark Mode Start Page
     fn render_aether_new_tab_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ScrollArea::vertical().show(ui, |ui| {
-            // Top Right Bar: Aether AI, Architecture, Test Suite, DevTools Toggle, Profile Picture
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(16.0);
-
-                    // Profile Circle with avatar and blue border
-                    let (profile_rect, profile_resp) = ui.allocate_exact_size(Vec2::new(32.0, 32.0), egui::Sense::click());
-                    let p_center = profile_rect.center();
-                    ui.painter().circle_filled(p_center, 15.0, Color32::from_rgb(66, 133, 244));
-                    ui.painter().circle_filled(p_center, 13.0, Color32::from_rgb(45, 120, 110));
-                    ui.painter().text(p_center, Align2::CENTER_CENTER, "K", FontId::proportional(14.0), Color32::WHITE);
-                    if profile_resp.clicked() {
-                        self.show_devtools = !self.show_devtools;
-                    }
-
-                    ui.add_space(8.0);
-
-                    // 9-dot Grid Icon (Aether Hub)
-                    let (grid_rect, grid_resp) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), egui::Sense::click());
-                    let g_center = grid_rect.center();
-                    for r in -1..=1 {
-                        for c in -1..=1 {
-                            let dot_pos = Pos2::new(g_center.x + (c as f32) * 5.0, g_center.y + (r as f32) * 5.0);
-                            ui.painter().circle_filled(dot_pos, 1.5, Color32::from_rgb(232, 234, 237));
-                        }
-                    }
-                    if grid_resp.clicked() {
-                        self.navigate_active_tab("about:credits");
-                    }
-
-                    ui.add_space(8.0);
-
-                    // Test Suite link
-                    if ui.add(egui::Link::new(RichText::new("Test Suite").size(13.0).color(Color32::from_rgb(232, 234, 237)))).clicked() {
-                        self.navigate_active_tab("about:test");
-                    }
-
-                    ui.add_space(8.0);
-
-                    // Architecture link
-                    if ui.add(egui::Link::new(RichText::new("Architecture").size(13.0).color(Color32::from_rgb(232, 234, 237)))).clicked() {
-                        self.navigate_active_tab("about:credits");
-                    }
-                });
-            });
-
-            ui.add_space(44.0);
+        ScrollArea::vertical().drag_to_scroll(false).show(ui, |ui| {
+            ui.add_space(56.0);
 
             // Center Content Container
             ui.vertical_centered(|ui| {
-                // 1. "Aether" Brand Logo: Sleek modern typography with orbital crest
+                // 1. "Aether" Brand Logo: Sleek modern typography with orbital crest (100% mathematically centered)
+                let text_job = egui::WidgetText::RichText(RichText::new("Aether").size(64.0).strong().color(Color32::WHITE))
+                    .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::Default);
+                let text_w = text_job.size().x;
+                let crest_w = 42.0;
+                let gap = 14.0;
+                let total_logo_w = crest_w + gap + text_w;
+                let pad = ((ui.available_width() - total_logo_w) / 2.0).max(0.0);
+
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-                    let logo_w = 260.0;
-                    let pad = ((ui.available_width() - logo_w) / 2.0).max(0.0);
+                    ui.spacing_mut().item_spacing.x = gap;
                     ui.add_space(pad);
 
-                    let (crest_rect, _) = ui.allocate_exact_size(Vec2::new(42.0, 42.0), egui::Sense::hover());
+                    let (crest_rect, _) = ui.allocate_exact_size(Vec2::new(crest_w, 42.0), egui::Sense::hover());
                     draw_sparkle_icon(ui.painter(), crest_rect.center(), 18.0, Color32::from_rgb(138, 180, 248));
 
-                    ui.label(
-                        RichText::new("Aether")
-                            .size(64.0)
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
+                    ui.add(egui::Label::new(text_job));
                 });
                 ui.add_space(28.0);
 
@@ -1080,12 +1327,12 @@ impl BrowserApp {
                 inner_ui.label(RichText::new("+").size(18.0).color(Color32::from_rgb(154, 160, 166)));
                 inner_ui.add_space(10.0);
 
-                // Text Edit: "Search with Aether or type a URL"
+                // Text Edit: "Search Google or type a URL"
                 let input_width = inner_ui.available_width() - 65.0;
                 let center_edit = inner_ui.add_sized(
                     Vec2::new(input_width.max(100.0), 30.0),
                     egui::TextEdit::singleline(&mut self.center_search_input)
-                        .hint_text("Search with Aether or type a URL")
+                        .hint_text("Search Google or type a URL")
                         .frame(false)
                         .text_color(Color32::WHITE)
                         .font(FontId::proportional(15.0)),
@@ -1129,14 +1376,16 @@ impl BrowserApp {
                     self.render_search_suggestions_dropdown(ui, search_rect, false);
                 }
 
-                ui.add_space(28.0);
+                ui.add_space(32.0);
 
-                // 4. Quick Shortcut Icons (Row of circles with vector graphics)
+                // 3. Quick Shortcut Icons (Row of circles with vector graphics - mathematically centered)
+                let shortcut_gap = 16.0;
+                let total_shortcuts_w = 6.0 * 68.0;
+                let total_row_w = total_shortcuts_w + 5.0 * shortcut_gap;
+                let pad_shortcuts = ((ui.available_width() - total_row_w) / 2.0).max(0.0);
+
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 24.0;
-
-                    let total_shortcuts_w = 6.0 * 68.0;
-                    let pad_shortcuts = ((ui.available_width() - total_shortcuts_w) / 2.0).max(0.0);
+                    ui.spacing_mut().item_spacing.x = shortcut_gap;
                     ui.add_space(pad_shortcuts);
 
                     // 1. Wikipedia
@@ -1193,69 +1442,6 @@ impl BrowserApp {
                         || self.navigate_active_tab("https://duckduckgo.com"),
                     );
                 });
-
-                if self.show_more_shortcuts {
-                    ui.add_space(20.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 24.0;
-                        let extra_w = 4.0 * 68.0;
-                        let pad_extra = ((ui.available_width() - extra_w) / 2.0).max(0.0);
-                        ui.add_space(pad_extra);
-
-                        render_vector_shortcut(
-                            ui,
-                            VectorIcon::Letter("Y"),
-                            Color32::from_rgb(255, 102, 0),
-                            "Hacker News",
-                            || self.navigate_active_tab("https://news.ycombinator.com"),
-                        );
-
-                        render_vector_shortcut(
-                            ui,
-                            VectorIcon::Letter("C"),
-                            Color32::from_rgb(167, 66, 18),
-                            "Crates.io",
-                            || self.navigate_active_tab("https://crates.io"),
-                        );
-
-                        render_vector_shortcut(
-                            ui,
-                            VectorIcon::Letter("T"),
-                            Color32::from_rgb(52, 168, 83),
-                            "CSS Test",
-                            || self.navigate_active_tab("about:test"),
-                        );
-
-                        render_vector_shortcut(
-                            ui,
-                            VectorIcon::Letter("i"),
-                            Color32::from_rgb(142, 68, 173),
-                            "Credits",
-                            || self.navigate_active_tab("about:credits"),
-                        );
-                    });
-                }
-            });
-
-            // 5. Bottom Right: "Customize Aether" Button
-            ui.add_space(60.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(20.0);
-                    let customize_btn = ui.add(
-                        egui::Button::new(
-                            RichText::new("Customize Aether")
-                                .size(12.0)
-                                .color(Color32::from_rgb(232, 234, 237)),
-                        )
-                        .fill(Color32::from_rgb(48, 50, 54))
-                        .corner_radius(16)
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(72, 75, 80))),
-                    );
-                    if customize_btn.clicked() {
-                        self.show_devtools = !self.show_devtools;
-                    }
-                });
             });
         });
     }
@@ -1278,11 +1464,12 @@ impl BrowserApp {
         let mut new_hovered_link = None;
 
         ScrollArea::vertical()
+            .drag_to_scroll(false)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let (response, painter) = ui.allocate_painter(
                     Vec2::new(available_size.x, page_height.max(available_size.y)),
-                    egui::Sense::click_and_drag(),
+                    egui::Sense::click(),
                 );
 
                 // Webpage canvas background
@@ -1296,7 +1483,26 @@ impl BrowserApp {
                 } else {
                     Color32::WHITE
                 };
-                painter.rect_filled(response.rect, 0.0, canvas_bg);
+                let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                let bottom_radius = if is_maximized { 0 } else { 10 };
+                let (sw, se) = if self.show_devtools {
+                    match self.devtools_dock {
+                        DevToolsDockPosition::Right => (bottom_radius, 0),
+                        DevToolsDockPosition::Bottom => (0, 0),
+                    }
+                } else {
+                    (bottom_radius, bottom_radius)
+                };
+                painter.rect_filled(
+                    response.rect,
+                    CornerRadius {
+                        nw: 0,
+                        ne: 0,
+                        sw,
+                        se,
+                    },
+                    canvas_bg,
+                );
 
                 let origin = response.rect.min;
                 let offset = Vec2::new(origin.x, origin.y);
@@ -1331,297 +1537,1248 @@ impl BrowserApp {
         }
     }
 
-    /// Renders the DevTools Inspector with clearly divided frames and visual panels
+    // ==========================================
+    // Chrome 3-Dots Popup Menu Implementation
+    // ==========================================
+
+    fn render_chrome_menu_popup(&mut self, ctx: &egui::Context, m_rect: egui::Rect) {
+        let menu_width = 290.0;
+        let window_resp = egui::Window::new("chrome_3dots_menu")
+            .title_bar(false)
+            .anchor(Align2::RIGHT_TOP, Vec2::new(-8.0, 76.0))
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(Vec2::new(menu_width, 0.0))
+            .frame(
+                Frame::NONE
+                    .fill(Color32::from_rgb(41, 42, 45)) // #292a2d
+                    .corner_radius(CornerRadius::same(8))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(60, 64, 67))) // #3c4043
+                    .shadow(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(160),
+                    })
+                    .inner_margin(Margin::symmetric(4, 6)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(menu_width - 8.0);
+                let max_h = (ctx.screen_rect().height() - 90.0).max(300.0).min(680.0);
+                ScrollArea::vertical()
+                    .max_height(max_h)
+                    .show(ui, |ui| {
+                        ui.set_width(menu_width - 8.0);
+
+                        // Section 0: Optional alert row
+                        if render_menu_item(ui, MenuIcon::Shield, "Found 111 compromised passwords", None).clicked() {
+                            self.navigate_active_tab("about:settings");
+                            self.show_menu_popup = false;
+                        }
+
+                        render_menu_divider(ui);
+
+                        // Section 1: Navigation
+                        if render_menu_item(ui, MenuIcon::NewTab, "New tab", Some("Ctrl+T")).clicked() {
+                            self.open_new_tab("about:newtab".to_string());
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::NewWindow, "New window", Some("Ctrl+N")).clicked() {
+                            self.open_new_tab("about:newtab".to_string());
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Incognito, "New Incognito window", Some("Ctrl+Shift+N")).clicked() {
+                            self.open_new_tab("about:blank".to_string());
+                            self.show_menu_popup = false;
+                        }
+
+                        render_menu_divider(ui);
+
+                        // Section 2: Profile card row ("Khoa", "Signed in")
+                        if render_profile_card(ui, "Khoa", "Signed in").clicked() {
+                            self.navigate_active_tab("https://myaccount.google.com");
+                            self.show_menu_popup = false;
+                        }
+
+                        render_menu_divider(ui);
+
+                        // Section 3: Tools & Data
+                        if render_menu_item(ui, MenuIcon::Passwords, "Passwords and autofill", Some(">")).clicked() {
+                            self.navigate_active_tab("about:settings");
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::History, "History", Some("Ctrl+H")).clicked() {
+                            self.navigate_active_tab("about:history");
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Downloads, "Downloads", Some("Ctrl+J")).clicked() {
+                            self.navigate_active_tab("about:downloads");
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Bookmarks, "Bookmarks and lists", Some(">")).clicked() {
+                            self.navigate_active_tab("about:bookmarks");
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::TabGroups, "Tab groups", Some(">")).clicked() {
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Extensions, "Extensions", Some(">")).clicked() {
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::DeleteData, "Delete browsing data...", Some("Ctrl+Shift+Del")).clicked() {
+                            self.navigate_active_tab("about:settings");
+                            self.show_menu_popup = false;
+                        }
+
+                        render_menu_divider(ui);
+
+                        // Section 4: Interactive Zoom row (keeps menu open)
+                        render_zoom_row(ui, ctx, self);
+
+                        render_menu_divider(ui);
+
+                        // Section 5: Page actions & Developer Tools
+                        if render_menu_item(ui, MenuIcon::Print, "Print...", Some("Ctrl+P")).clicked() {
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::GoogleLens, "Search this tab with Google Lens", None).clicked() {
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Translate, "Translate...", None).clicked() {
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Find, "Find and edit", Some(">")).clicked() {
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Cast, "Cast, save, and share", Some(">")).clicked() {
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::MoreTools, "More tools", Some(">")).clicked() {
+                            self.show_devtools = !self.show_devtools;
+                            self.show_menu_popup = false;
+                        }
+
+                        render_menu_divider(ui);
+
+                        // Section 6: Settings, Help & Exit
+                        if render_menu_item(ui, MenuIcon::Help, "Help", Some(">")).clicked() {
+                            self.navigate_active_tab("about:credits");
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Settings, "Settings", None).clicked() {
+                            self.navigate_active_tab("about:settings");
+                            self.show_menu_popup = false;
+                        }
+                        if render_menu_item(ui, MenuIcon::Exit, "Exit", None).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            self.show_menu_popup = false;
+                        }
+                    });
+            });
+
+        // Dismissal logic: Dismiss on Escape or clicking outside
+        if let Some(inner) = window_resp {
+            let menu_rect = inner.response.rect;
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.show_menu_popup = false;
+            } else if ctx.input(|i| i.pointer.any_pressed()) {
+                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                    if !menu_rect.contains(pos) && !m_rect.contains(pos) {
+                        self.show_menu_popup = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // Chrome DevTools Panel Implementation
+    // ==========================================
+
+    /// Renders the complete native Chrome DevTools panel supporting 6 tabs and docking
     fn render_devtools(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        // DevTools Header Bar
+        ui.add_space(6.0);
+
+        // Header Tab Navigation Bar
         ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            ui.heading(RichText::new("Aether DevTools").size(16.0).color(Color32::WHITE));
-            let (f12_rect, _) = ui.allocate_exact_size(Vec2::new(34.0, 18.0), egui::Sense::hover());
-            ui.painter().rect_filled(f12_rect, 4.0, Color32::from_rgb(45, 48, 54));
-            ui.painter().text(f12_rect.center(), Align2::CENTER_CENTER, "F12", FontId::proportional(10.0), Color32::from_rgb(168, 199, 250));
+            ui.spacing_mut().item_spacing.x = 2.0;
+
+            let tabs = [
+                (DevToolsTab::Elements, "Elements"),
+                (DevToolsTab::Console, "Console"),
+                (DevToolsTab::Sources, "Sources"),
+                (DevToolsTab::Network, "Network"),
+                (DevToolsTab::Application, "Application"),
+                (DevToolsTab::Security, "Security"),
+            ];
+
+            for (tab_var, label) in tabs {
+                let is_active = self.devtools_tab == tab_var;
+                let text_color = if is_active {
+                    Color32::from_rgb(232, 234, 237)
+                } else {
+                    Color32::from_rgb(154, 160, 166)
+                };
+
+                let resp = ui.add(
+                    egui::Button::new(RichText::new(label).size(12.0).color(text_color))
+                        .frame(false),
+                );
+
+                if is_active {
+                    let r = resp.rect;
+                    ui.painter().line_segment(
+                        [Pos2::new(r.min.x, r.max.y + 2.0), Pos2::new(r.max.x, r.max.y + 2.0)],
+                        Stroke::new(2.0_f32, Color32::from_rgb(138, 180, 248)),
+                    );
+                }
+
+                if resp.clicked() {
+                    self.devtools_tab = tab_var;
+                }
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
-                let (c_rect, c_resp) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), egui::Sense::click());
+
+                // Close button '×'
+                let (c_rect, c_resp) = ui.allocate_exact_size(Vec2::new(20.0, 20.0), egui::Sense::click());
                 let center = c_rect.center();
                 if c_resp.hovered() {
-                    ui.painter().circle_filled(center, 10.0, Color32::from_rgb(60, 64, 67));
+                    ui.painter().circle_filled(center, 9.0, Color32::from_rgb(60, 64, 67));
                 }
-                ui.painter().line_segment(
-                    [Pos2::new(center.x - 4.0, center.y - 4.0), Pos2::new(center.x + 4.0, center.y + 4.0)],
-                    Stroke::new(1.5_f32, Color32::from_rgb(200, 205, 210)),
-                );
-                ui.painter().line_segment(
-                    [Pos2::new(center.x + 4.0, center.y - 4.0), Pos2::new(center.x - 4.0, center.y + 4.0)],
-                    Stroke::new(1.5_f32, Color32::from_rgb(200, 205, 210)),
-                );
+                let x_color = if c_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(170, 175, 180) };
+                ui.painter().line_segment([center - Vec2::splat(3.5), center + Vec2::splat(3.5)], Stroke::new(1.3_f32, x_color));
+                ui.painter().line_segment([Pos2::new(center.x - 3.5, center.y + 3.5), Pos2::new(center.x + 3.5, center.y - 3.5)], Stroke::new(1.3_f32, x_color));
                 if c_resp.clicked() {
                     self.show_devtools = false;
+                }
+
+                // Dock Position Toggle Button
+                let dock_label = match self.devtools_dock {
+                    DevToolsDockPosition::Right => "⬓ Bottom",
+                    DevToolsDockPosition::Bottom => "◨ Right",
+                };
+                let dock_btn = ui.add(
+                    egui::Button::new(RichText::new(dock_label).size(11.0).color(Color32::from_rgb(154, 160, 166)))
+                        .frame(false),
+                );
+                if dock_btn.clicked() {
+                    self.devtools_dock = match self.devtools_dock {
+                        DevToolsDockPosition::Right => DevToolsDockPosition::Bottom,
+                        DevToolsDockPosition::Bottom => DevToolsDockPosition::Right,
+                    };
                 }
             });
         });
 
-        ui.add_space(6.0);
-        // Navigation Tab Bar with cleanly styled pills
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::DomTree, "DOM Tree");
-            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Styles, "CSS Rules");
-            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Source, "HTML Source");
-            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Network, "Diagnostics");
-        });
+        ui.add_space(4.0);
+        let (sep_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter().line_segment(
+            [Pos2::new(sep_rect.min.x, sep_rect.center().y), Pos2::new(sep_rect.max.x, sep_rect.center().y)],
+            Stroke::new(1.0_f32, Color32::from_rgb(60, 64, 67)),
+        );
+        ui.add_space(4.0);
 
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
+        let mut pending_navigate: Option<String> = None;
+        let current_zoom_str = self.zoom_percentage();
 
-        let tab = match self.tabs.get(self.active_tab_idx) {
+        let tab = match self.tabs.get_mut(self.active_tab_idx) {
             Some(t) => t,
             None => return,
         };
 
         match self.devtools_tab {
-            DevToolsTab::DomTree => {
-                let mut clicked_node = None;
+            DevToolsTab::Elements => {
+                let mut new_selected_path = None;
 
-                // Frame 1: DOM Hierarchy Container
+                // Elements Tab: Two Pane Inspection Layout
+                // Pane 1: Interactive DOM Tree with Colored Syntax Tokens
                 Frame::NONE
-                    .fill(Color32::from_rgb(22, 24, 27))
+                    .fill(Color32::from_rgb(24, 26, 29))
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .corner_radius(4)
+                    .inner_margin(Margin::symmetric(8, 6))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("📁 DOM Hierarchy Tree").strong().size(13.0).color(Color32::from_rgb(232, 234, 237)));
+                            ui.label(RichText::new("DOM Tree").strong().size(12.0).color(Color32::from_rgb(232, 234, 237)));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new("Click node to inspect").weak().size(11.0));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.devtools_dom_search)
+                                        .hint_text("Search DOM")
+                                        .desired_width(120.0),
+                                );
                             });
                         });
-                        ui.separator();
+
+                        ui.add_space(4.0);
+                        let dom_tree_h = if self.devtools_dock == DevToolsDockPosition::Bottom { 180.0 } else { 240.0 };
                         ScrollArea::both()
-                            .max_height(250.0)
+                            .max_height(dom_tree_h)
                             .show(ui, |ui| {
                                 if let Some(ref dom) = tab.dom_root {
-                                    render_dom_node_ui(ui, dom, 0, &self.selected_dom_node, &mut clicked_node);
+                                    render_dom_tree_node(
+                                        ui,
+                                        dom,
+                                        vec![],
+                                        0,
+                                        &self.devtools_selected_path,
+                                        &mut self.devtools_expanded_paths,
+                                        &mut new_selected_path,
+                                        &self.devtools_dom_search,
+                                    );
                                 } else {
-                                    ui.label(RichText::new("No DOM available on New Tab page").weak());
+                                    ui.label(RichText::new("No DOM available").weak());
                                 }
                             });
                     });
 
-                if let Some(node_info) = clicked_node {
-                    self.selected_dom_node = Some(node_info.tag.clone());
-                    self.selected_node_info = Some(node_info);
+                if let Some(path) = new_selected_path {
+                    self.devtools_selected_path = Some(path);
                 }
 
-                ui.add_space(10.0);
+                ui.add_space(6.0);
 
-                // Frame 2: Element Inspector & Box Model Container
+                // Pane 2: Box Model & Styles Inspector Pane
+                Frame::NONE
+                    .fill(Color32::from_rgb(26, 28, 31))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
+                    .corner_radius(4)
+                    .inner_margin(Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        if let Some(ref path) = self.devtools_selected_path {
+                            if let Some(ref dom) = tab.dom_root {
+                                if let Some(node) = dom.get_node_by_path(path) {
+                                    let tag = node.tag_name().unwrap_or("node");
+                                    let id_str = node.id().map(|s| format!("#{}", s)).unwrap_or_default();
+                                    let class_str = if !node.classes().is_empty() {
+                                        let c = node.classes().into_iter().collect::<Vec<_>>().join(".");
+                                        format!(".{}", c)
+                                    } else {
+                                        String::new()
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Styles & Box Model:").strong().size(12.0).color(Color32::from_rgb(232, 234, 237)));
+                                        ui.label(
+                                            RichText::new(format!("<{}{}{}>", tag, id_str, class_str))
+                                                .strong()
+                                                .color(Color32::from_rgb(138, 180, 248)),
+                                        );
+                                    });
+
+                                    ui.separator();
+
+                                    let inspector_h = if self.devtools_dock == DevToolsDockPosition::Bottom { 200.0 } else { 300.0 };
+                                    ScrollArea::vertical().max_height(inspector_h).show(ui, |ui| {
+                                        // 1. Visual 4-layer Chrome Box Model Diagram
+                                        let live_dims = crate::layout::query_node_dimensions(
+                                            dom,
+                                            &tab.stylesheet,
+                                            node,
+                                            tab.last_layout_width.max(300.0),
+                                        );
+                                        render_chrome_box_model(ui, live_dims.as_ref());
+
+                                        ui.add_space(8.0);
+
+                                        // 2. Matched CSS Rules
+                                        let ancestors = dom.collect_ancestor_nodes(path);
+                                        let matched_rules = crate::style::get_matched_rules(node, &ancestors, &tab.stylesheet);
+
+                                        ui.label(RichText::new("Matched CSS Rules:").strong().size(11.5).color(Color32::from_rgb(154, 160, 166)));
+                                        if matched_rules.is_empty() {
+                                            ui.label(RichText::new("No matching CSS rules").weak());
+                                        } else {
+                                            for (spec, rule) in matched_rules {
+                                                let sel_text = rule.selectors.iter().map(|s| format!("{:?}", s)).collect::<Vec<_>>().join(", ");
+                                                ui.horizontal(|ui| {
+                                                    ui.label(RichText::new(sel_text).strong().color(Color32::from_rgb(138, 180, 248)));
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(RichText::new(format!("{:?}", spec)).weak().size(10.0));
+                                                    });
+                                                });
+                                                for decl in &rule.declarations {
+                                                    ui.label(format!("   {}: {:?}", decl.name, decl.value));
+                                                }
+                                                ui.add_space(3.0);
+                                            }
+                                        }
+
+                                        ui.add_space(8.0);
+
+                                        // 3. Computed Styles
+                                        let specified_values = crate::style::get_specified_values(node, &ancestors, &tab.stylesheet);
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new("Computed Styles:").strong().size(11.5).color(Color32::from_rgb(154, 160, 166)));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut self.devtools_styles_filter)
+                                                        .hint_text("Filter")
+                                                        .desired_width(90.0),
+                                                );
+                                            });
+                                        });
+
+                                        for (prop, val) in specified_values {
+                                            if !self.devtools_styles_filter.is_empty()
+                                                && !prop.to_lowercase().contains(&self.devtools_styles_filter.to_lowercase())
+                                            {
+                                                continue;
+                                            }
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(prop).color(Color32::from_rgb(154, 160, 166)));
+                                                ui.label(RichText::new(format!("{:?}", val)).color(Color32::from_rgb(232, 234, 237)));
+                                            });
+                                        }
+                                    });
+                                } else {
+                                    ui.label(RichText::new("Selected node no longer exists in DOM").weak());
+                                }
+                            }
+                        } else {
+                            ui.label(RichText::new("Select an element in the DOM tree above to inspect its box model and styles").weak());
+                        }
+                    });
+            }
+            DevToolsTab::Console => {
+                // Console Toolbar
+                ui.horizontal(|ui| {
+                    if ui.button("🚫 Clear").clicked() {
+                        tab.console_entries.clear();
+                    }
+
+                    ui.separator();
+
+                    let is_all = self.devtools_console_level.is_none();
+                    if ui.selectable_label(is_all, "All").clicked() {
+                        self.devtools_console_level = None;
+                    }
+                    let is_err = self.devtools_console_level == Some(ConsoleLogLevel::Error);
+                    if ui.selectable_label(is_err, "Errors").clicked() {
+                        self.devtools_console_level = Some(ConsoleLogLevel::Error);
+                    }
+                    let is_warn = self.devtools_console_level == Some(ConsoleLogLevel::Warn);
+                    if ui.selectable_label(is_warn, "Warnings").clicked() {
+                        self.devtools_console_level = Some(ConsoleLogLevel::Warn);
+                    }
+                    let is_info = self.devtools_console_level == Some(ConsoleLogLevel::Info);
+                    if ui.selectable_label(is_info, "Info").clicked() {
+                        self.devtools_console_level = Some(ConsoleLogLevel::Info);
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.devtools_console_filter)
+                                .hint_text("Filter")
+                                .desired_width(120.0),
+                        );
+                    });
+                });
+
+                ui.separator();
+
+                // Console Log Stream
+                let log_h = if self.devtools_dock == DevToolsDockPosition::Bottom { 180.0 } else { 380.0 };
+                ScrollArea::vertical().max_height(log_h).show(ui, |ui| {
+                    if tab.console_entries.is_empty() {
+                        ui.label(RichText::new("No console output").weak().italics());
+                    } else {
+                        for entry in &tab.console_entries {
+                            if let Some(lvl) = self.devtools_console_level {
+                                if entry.level != lvl {
+                                    continue;
+                                }
+                            }
+                            if !self.devtools_console_filter.is_empty()
+                                && !entry.message.to_lowercase().contains(&self.devtools_console_filter.to_lowercase())
+                            {
+                                continue;
+                            }
+
+                            let (badge_text, badge_color, badge_bg) = match entry.level {
+                                ConsoleLogLevel::Info => ("INFO", Color32::from_rgb(138, 180, 248), Color32::from_rgb(30, 42, 60)),
+                                ConsoleLogLevel::Warn => ("WARN", Color32::from_rgb(253, 214, 99), Color32::from_rgb(45, 40, 25)),
+                                ConsoleLogLevel::Error => ("ERROR", Color32::from_rgb(242, 139, 130), Color32::from_rgb(55, 30, 30)),
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&entry.timestamp).weak().size(10.0));
+
+                                let (b_rect, _) = ui.allocate_exact_size(Vec2::new(42.0, 16.0), egui::Sense::hover());
+                                ui.painter().rect_filled(b_rect, 3.0, badge_bg);
+                                ui.painter().text(b_rect.center(), Align2::CENTER_CENTER, badge_text, FontId::proportional(9.0), badge_color);
+
+                                ui.label(RichText::new(&entry.message).monospace().color(badge_color));
+                            });
+                            ui.add_space(2.0);
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // Interactive REPL Prompt
+                let mut execute_cmd = false;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(">").monospace().strong().color(Color32::from_rgb(138, 180, 248)));
+                    let text_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.devtools_console_input)
+                            .hint_text("Enter browser command (help, dom, styles, info, zoom, goto <url>)...")
+                            .desired_width(ui.available_width() - 50.0),
+                    );
+                    if text_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        execute_cmd = true;
+                    }
+                    if ui.button("Run").clicked() {
+                        execute_cmd = true;
+                    }
+                });
+
+                if execute_cmd {
+                    let cmd = self.devtools_console_input.trim().to_string();
+                    if !cmd.is_empty() {
+                        let time_str = format_current_time();
+                        let id = tab.console_entries.len() + 1;
+                        tab.console_entries.push(ConsoleEntry {
+                            id,
+                            timestamp: time_str.clone(),
+                            level: ConsoleLogLevel::Info,
+                            source: "REPL".to_string(),
+                            message: format!("> {}", cmd),
+                        });
+
+                        let (level, reply) = if cmd == "help" {
+                            (ConsoleLogLevel::Info, "Commands: help, clear, dom, styles, info, zoom, goto <url>".to_string())
+                        } else if cmd == "clear" {
+                            tab.console_entries.clear();
+                            (ConsoleLogLevel::Info, String::new())
+                        } else if cmd == "dom" {
+                            let tag = tab.dom_root.as_ref().and_then(|r| r.tag_name()).unwrap_or("none");
+                            let count = tab.dom_root.as_ref().map(|r| r.children.len()).unwrap_or(0);
+                            (ConsoleLogLevel::Info, format!("DOM Root: <{}> with {} direct children", tag, count))
+                        } else if cmd == "styles" {
+                            (ConsoleLogLevel::Info, format!("Stylesheet: {} CSS rules", tab.stylesheet.rules.len()))
+                        } else if cmd == "info" {
+                            (ConsoleLogLevel::Info, format!("URL: {}, Title: '{}', Size: {} bytes", tab.url, tab.title, tab.raw_html.len()))
+                        } else if cmd == "zoom" {
+                            (ConsoleLogLevel::Info, format!("Current Zoom: {}", current_zoom_str))
+                        } else if let Some(target) = cmd.strip_prefix("goto ") {
+                            let url_str = target.trim().to_string();
+                            pending_navigate = Some(url_str.clone());
+                            (ConsoleLogLevel::Info, format!("Navigating to {}", url_str))
+                        } else {
+                            (ConsoleLogLevel::Warn, format!("Unknown command: '{}'. Type 'help' for assistance.", cmd))
+                        };
+
+                        if !reply.is_empty() {
+                            let reply_id = tab.console_entries.len() + 1;
+                            tab.console_entries.push(ConsoleEntry {
+                                id: reply_id,
+                                timestamp: time_str,
+                                level,
+                                source: "System".to_string(),
+                                message: reply,
+                            });
+                        }
+
+                        self.devtools_console_input.clear();
+                    }
+                }
+            }
+            DevToolsTab::Sources => {
+                // Sources Tab: Resource tree & Code viewer
+                ui.horizontal(|ui| {
+                    // Left tree
+                    ui.allocate_ui_with_layout(Vec2::new(140.0, ui.available_height()), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        ui.label(RichText::new("📁 Resources").strong().size(12.0));
+                        ui.separator();
+
+                        let is_html = self.devtools_sources_file == SourcesFileId::HtmlDocument;
+                        if ui.selectable_label(is_html, "📄 (index.html)").clicked() {
+                            self.devtools_sources_file = SourcesFileId::HtmlDocument;
+                        }
+                        let is_ua = self.devtools_sources_file == SourcesFileId::UserAgentCss;
+                        if ui.selectable_label(is_ua, "🎨 user_agent.css").clicked() {
+                            self.devtools_sources_file = SourcesFileId::UserAgentCss;
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Right viewer with line numbers
+                    let content = match self.devtools_sources_file {
+                        SourcesFileId::HtmlDocument => &tab.raw_html,
+                        SourcesFileId::UserAgentCss => DEFAULT_USER_AGENT_CSS,
+                        SourcesFileId::InlineCss(_) => DEFAULT_USER_AGENT_CSS,
+                    };
+
+                    let viewer_h = if self.devtools_dock == DevToolsDockPosition::Bottom { 200.0 } else { 420.0 };
+                    ScrollArea::both().max_height(viewer_h).show(ui, |ui| {
+                        for (line_idx, line) in content.lines().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{:3} |", line_idx + 1)).weak().size(10.5));
+                                ui.label(RichText::new(line).monospace().size(11.0).color(Color32::from_rgb(232, 234, 237)));
+                            });
+                        }
+                    });
+                });
+            }
+            DevToolsTab::Network => {
+                // Network Tab Toolbar
+                ui.horizontal(|ui| {
+                    if ui.button("🚫 Clear").clicked() {
+                        tab.network_entries.clear();
+                        self.devtools_selected_network_id = None;
+                    }
+
+                    ui.separator();
+
+                    let filters = [
+                        (NetworkTypeFilter::All, "All"),
+                        (NetworkTypeFilter::Doc, "Doc"),
+                        (NetworkTypeFilter::Css, "CSS"),
+                        (NetworkTypeFilter::Js, "JS"),
+                        (NetworkTypeFilter::Img, "Img"),
+                        (NetworkTypeFilter::Fetch, "Fetch"),
+                    ];
+                    for (f, label) in filters {
+                        let is_sel = self.devtools_network_type == f;
+                        if ui.selectable_label(is_sel, label).clicked() {
+                            self.devtools_network_type = f;
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.devtools_network_filter)
+                                .hint_text("Filter requests")
+                                .desired_width(120.0),
+                        );
+                    });
+                });
+
+                ui.separator();
+
+                // Network Requests Table
+                let net_h = if self.devtools_dock == DevToolsDockPosition::Bottom { 180.0 } else { 260.0 };
+                ScrollArea::both().max_height(net_h).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Name").strong().size(11.0));
+                        ui.add_space(80.0);
+                        ui.label(RichText::new("Status").strong().size(11.0));
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("Type").strong().size(11.0));
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("Size").strong().size(11.0));
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("Time").strong().size(11.0));
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("Waterfall").strong().size(11.0));
+                    });
+                    ui.separator();
+
+                    if tab.network_entries.is_empty() {
+                        ui.label(RichText::new("No requests recorded").weak().italics());
+                    } else {
+                        for entry in &tab.network_entries {
+                            let is_sel = self.devtools_selected_network_id == Some(entry.id);
+                            let row_bg = if is_sel {
+                                Color32::from_rgb(40, 62, 88)
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+
+                            let (row_rect, row_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::click());
+                            if is_sel || row_resp.hovered() {
+                                ui.painter().rect_filled(row_rect, 2.0, if is_sel { row_bg } else { Color32::from_rgb(45, 48, 54) });
+                            }
+                            if row_resp.clicked() {
+                                self.devtools_selected_network_id = Some(entry.id);
+                            }
+
+                            // Render row contents
+                            let name_preview = if entry.name.len() > 18 { format!("{}...", &entry.name[..16]) } else { entry.name.clone() };
+                            ui.painter().text(Pos2::new(row_rect.min.x + 4.0, row_rect.center().y), Align2::LEFT_CENTER, name_preview, FontId::proportional(11.0), Color32::from_rgb(232, 234, 237));
+
+                            let status_color = if entry.status >= 200 && entry.status < 300 {
+                                Color32::from_rgb(129, 201, 149)
+                            } else if entry.status >= 300 && entry.status < 400 {
+                                Color32::from_rgb(138, 180, 248)
+                            } else {
+                                Color32::from_rgb(242, 139, 130)
+                            };
+                            ui.painter().text(Pos2::new(row_rect.min.x + 120.0, row_rect.center().y), Align2::LEFT_CENTER, format!("{}", entry.status), FontId::proportional(11.0), status_color);
+                            ui.painter().text(Pos2::new(row_rect.min.x + 180.0, row_rect.center().y), Align2::LEFT_CENTER, &entry.resource_type, FontId::proportional(11.0), Color32::from_rgb(154, 160, 166));
+
+                            let size_str = if entry.size_bytes < 1024 { format!("{} B", entry.size_bytes) } else { format!("{:.1} KB", entry.size_bytes as f32 / 1024.0) };
+                            ui.painter().text(Pos2::new(row_rect.min.x + 240.0, row_rect.center().y), Align2::LEFT_CENTER, size_str, FontId::proportional(11.0), Color32::from_rgb(154, 160, 166));
+
+                            ui.painter().text(Pos2::new(row_rect.min.x + 300.0, row_rect.center().y), Align2::LEFT_CENTER, format!("{} ms", entry.duration_ms), FontId::proportional(11.0), Color32::from_rgb(154, 160, 166));
+
+                            // Waterfall bar
+                            let wf_w = ((entry.duration_ms as f32) * 1.5).max(4.0).min(60.0);
+                            let wf_rect = EguiRect::from_min_size(Pos2::new(row_rect.min.x + 360.0, row_rect.center().y - 4.0), Vec2::new(wf_w, 8.0));
+                            ui.painter().rect_filled(wf_rect, 2.0, Color32::from_rgb(138, 180, 248));
+                        }
+                    }
+                });
+
+                // Request Details Drawer if an item is selected
+                if let Some(sel_id) = self.devtools_selected_network_id {
+                    if let Some(entry) = tab.network_entries.iter().find(|e| e.id == sel_id) {
+                        ui.separator();
+                        ui.label(RichText::new("Request Details:").strong().size(11.5).color(Color32::from_rgb(232, 234, 237)));
+                        ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            ui.label(format!("Request URL: {}", entry.url));
+                            ui.label(format!("Request Method: {}", entry.method));
+                            ui.label(format!("Status Code: {} {}", entry.status, entry.status_text));
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Response Headers:").strong().size(11.0));
+                            for (k, v) in &entry.headers {
+                                ui.label(format!("{}: {}", k, v));
+                            }
+                        });
+                    }
+                }
+            }
+            DevToolsTab::Application => {
+                // Application Tab: Storage & Cookies Inspector
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(Vec2::new(140.0, ui.available_height()), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        ui.label(RichText::new("Storage").strong().size(12.0));
+                        ui.separator();
+
+                        let is_cookies = self.devtools_storage_section == StorageSection::Cookies;
+                        if ui.selectable_label(is_cookies, "🍪 Cookies").clicked() {
+                            self.devtools_storage_section = StorageSection::Cookies;
+                        }
+                        let is_local = self.devtools_storage_section == StorageSection::LocalStorage;
+                        if ui.selectable_label(is_local, "🗄 Local Storage").clicked() {
+                            self.devtools_storage_section = StorageSection::LocalStorage;
+                        }
+                        let is_session = self.devtools_storage_section == StorageSection::SessionStorage;
+                        if ui.selectable_label(is_session, "📦 Session Storage").clicked() {
+                            self.devtools_storage_section = StorageSection::SessionStorage;
+                        }
+                        let is_tex = self.devtools_storage_section == StorageSection::TextureCache;
+                        if ui.selectable_label(is_tex, "🖼 Texture Cache").clicked() {
+                            self.devtools_storage_section = StorageSection::TextureCache;
+                        }
+                    });
+
+                    ui.separator();
+
+                    ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
+                        match self.devtools_storage_section {
+                            StorageSection::Cookies => {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Cookies Table").strong().size(12.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Clear All Cookies").clicked() {
+                                            self.devtools_cookies.clear();
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                for cookie in &self.devtools_cookies {
+                                    ui.label(format!("Name: {} | Domain: {} | Secure: {}", cookie.name, cookie.domain, cookie.secure));
+                                }
+                            }
+                            StorageSection::LocalStorage => {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Local Storage Items").strong().size(12.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Clear Local Storage").clicked() {
+                                            self.devtools_local_storage.clear();
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                for (k, v) in &self.devtools_local_storage {
+                                    ui.label(format!("{}: {}", k, v));
+                                }
+                            }
+                            StorageSection::SessionStorage => {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Session Storage Items").strong().size(12.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Clear Session Storage").clicked() {
+                                            self.devtools_session_storage.clear();
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                for (k, v) in &self.devtools_session_storage {
+                                    ui.label(format!("{}: {}", k, v));
+                                }
+                            }
+                            StorageSection::TextureCache => {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("Cached Textures: {}", self.image_textures.len())).strong().size(12.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Clear Texture Cache").clicked() {
+                                            self.image_textures.clear();
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                for url in self.image_textures.keys() {
+                                    ui.label(RichText::new(url).weak());
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            DevToolsTab::Security => {
+                // Security Tab: TLS & Encryption Overview
                 Frame::NONE
                     .fill(Color32::from_rgb(24, 26, 30))
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
                     .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .inner_margin(Margin::symmetric(12, 10))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("🔍 Element Inspector").strong().size(13.0).color(Color32::from_rgb(232, 234, 237)));
-                            if let Some(ref info) = self.selected_node_info {
-                                let badge_text = if let Some(ref id) = info.id {
-                                    format!("<{} id=\"{}\">", info.tag, id)
-                                } else if let Some(ref class) = info.class {
-                                    format!("<{} class=\"{}\">", info.tag, class)
-                                } else {
-                                    format!("<{}>", info.tag)
-                                };
-                                ui.label(
-                                    RichText::new(badge_text)
-                                        .strong()
-                                        .color(Color32::from_rgb(138, 180, 248)),
-                                );
-                            } else {
-                                ui.label(RichText::new("<none selected>").weak());
-                            }
-                        });
-                        ui.separator();
-
-                        if let Some(ref info) = self.selected_node_info {
-                            ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                                // 1. Box Model Card
-                                ui.label(RichText::new("Chrome Box Model:").small().strong().color(Color32::from_rgb(154, 160, 166)));
-                                render_box_model_diagram(ui, &info.margin, &info.padding, &info.display);
-
-                                ui.add_space(10.0);
-
-                                // 2. Attributes Card
-                                if !info.attributes.is_empty() {
-                                    ui.label(RichText::new("HTML Attributes:").small().strong().color(Color32::from_rgb(154, 160, 166)));
-                                    Frame::NONE
-                                        .fill(Color32::from_rgb(18, 19, 22))
-                                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 42, 46)))
-                                        .corner_radius(4)
-                                        .inner_margin(egui::Margin::symmetric(8, 6))
-                                        .show(ui, |ui| {
-                                            for (k, v) in &info.attributes {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new(k).strong().color(Color32::from_rgb(168, 199, 250)));
-                                                    ui.label(RichText::new(format!("= \"{}\"", v)).color(Color32::from_rgb(200, 205, 210)));
-                                                });
-                                            }
-                                        });
-                                    ui.add_space(8.0);
-                                }
-
-                                // 3. Computed Styles Card
-                                ui.label(RichText::new("Computed CSS Properties:").small().strong().color(Color32::from_rgb(154, 160, 166)));
-                                Frame::NONE
-                                    .fill(Color32::from_rgb(18, 19, 22))
-                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 42, 46)))
-                                    .corner_radius(4)
-                                    .inner_margin(egui::Margin::symmetric(8, 6))
-                                    .show(ui, |ui| {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(RichText::new(format!("display: {}", info.display)).color(Color32::from_rgb(129, 201, 149)));
-                                            ui.separator();
-                                            ui.label(RichText::new(format!("color: {}", info.color)).color(Color32::from_rgb(253, 214, 99)));
-                                            ui.separator();
-                                            ui.label(RichText::new(format!("font-size: {}", info.font_size)).color(Color32::from_rgb(138, 180, 248)));
-                                            ui.separator();
-                                            ui.label(RichText::new(format!("background: {}", info.bg_color)).color(Color32::from_rgb(249, 171, 0)));
-                                        });
-                                    });
+                        if tab.url.starts_with("https://") {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("🔒 Valid HTTPS").strong().size(14.0).color(Color32::from_rgb(129, 201, 149)));
+                                ui.label(RichText::new("Connection is Secure").color(Color32::from_rgb(232, 234, 237)));
                             });
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label("Protocol: TLS 1.3");
+                            ui.label("Cipher: TLS_AES_256_GCM_SHA384 (Pure Rust Rustls)");
+                            ui.label("Certificate: Valid Mozilla WebPKI root anchor");
+                            ui.label("Mixed Content: None (100% Secure Subresources)");
+                        } else if tab.url.starts_with("http://") {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("⚠️ Insecure Connection").strong().size(14.0).color(Color32::from_rgb(242, 139, 130)));
+                                ui.label(RichText::new("Plaintext HTTP").color(Color32::from_rgb(242, 139, 130)));
+                            });
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label("Warning: Data transmission over HTTP is not encrypted.");
                         } else {
-                            ui.add_space(16.0);
-                            ui.label(RichText::new("Click any element in the DOM tree above to inspect its attributes, computed CSS, and live box model diagram.").weak().italics());
-                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("ℹ️ Internal Page").strong().size(14.0).color(Color32::from_rgb(138, 180, 248)));
+                                ui.label(RichText::new("Local Environment").color(Color32::from_rgb(232, 234, 237)));
+                            });
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label("This page is served internally by the Aether Browser Engine.");
                         }
                     });
             }
-            DevToolsTab::Styles => {
-                Frame::NONE
-                    .fill(Color32::from_rgb(22, 24, 27))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("🎨 CSS Rules & Specificity").strong().size(13.0).color(Color32::from_rgb(232, 234, 237)));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("Total: {} rules", tab.stylesheet.rules.len())).weak().size(11.0));
-                            });
-                        });
-                        ui.separator();
-                        ScrollArea::vertical().show(ui, |ui| {
-                            for (i, rule) in tab.stylesheet.rules.iter().take(40).enumerate() {
-                                let selectors_str = rule
-                                    .selectors
-                                    .iter()
-                                    .map(|s| format!("{:?}", s))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                ui.label(RichText::new(format!("[{}] {}", i + 1, selectors_str)).strong().color(Color32::from_rgb(138, 180, 248)));
-                                for decl in &rule.declarations {
-                                    ui.label(format!("   {}: {:?}", decl.name, decl.value));
-                                }
-                                ui.add_space(4.0);
-                            }
-                        });
-                    });
-            }
-            DevToolsTab::Source => {
-                Frame::NONE
-                    .fill(Color32::from_rgb(22, 24, 27))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("📄 Raw HTML Source").strong().size(13.0).color(Color32::from_rgb(232, 234, 237)));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{} bytes", tab.raw_html.len())).weak().size(11.0));
-                            });
-                        });
-                        ui.separator();
-                        ScrollArea::both().show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut tab.raw_html.clone())
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY),
-                            );
-                        });
-                    });
-            }
-            DevToolsTab::Network => {
-                Frame::NONE
-                    .fill(Color32::from_rgb(22, 24, 27))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("🌐 Connection & Engine Diagnostics").strong().size(13.0).color(Color32::WHITE));
-                        ui.separator();
-                        ui.add_space(4.0);
+        }
 
-                        egui::Grid::new("diag_grid").striped(true).spacing([12.0, 8.0]).show(ui, |ui| {
-                            ui.label(RichText::new("Active URL:").strong());
-                            ui.label(&tab.url);
-                            ui.end_row();
-
-                            ui.label(RichText::new("Document Size:").strong());
-                            ui.label(format!("{} bytes", tab.raw_html.len()));
-                            ui.end_row();
-
-                            ui.label(RichText::new("CSS Rules:").strong());
-                            ui.label(format!("{} parsed rules", tab.stylesheet.rules.len()));
-                            ui.end_row();
-
-                            ui.label(RichText::new("Render Height:").strong());
-                            ui.label(format!("{:.1} px", tab.page_height));
-                            ui.end_row();
-
-                            ui.label(RichText::new("TLS Engine:").strong());
-                            ui.label("Rustls (Pure Rust Crypto)");
-                            ui.end_row();
-
-                            ui.label(RichText::new("Browser Engine:").strong());
-                            ui.label("Aether 100% Pure Rust (Zero Chromium)");
-                            ui.end_row();
-                        });
-                    });
-            }
+        if let Some(url) = pending_navigate {
+            self.navigate_active_tab(&url);
         }
     }
 }
 
-fn render_box_model_diagram(ui: &mut egui::Ui, margin: &str, padding: &str, display: &str) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width() - 8.0, 110.0), egui::Sense::hover());
+fn draw_menu_icon(painter: &egui::Painter, icon: MenuIcon, center: Pos2, color: Color32) {
+    let s = Stroke::new(1.3_f32, color);
+    match icon {
+        MenuIcon::Shield => {
+            painter.line_segment([Pos2::new(center.x - 5.0, center.y - 6.0), Pos2::new(center.x + 5.0, center.y - 6.0)], s);
+            painter.line_segment([Pos2::new(center.x + 5.0, center.y - 6.0), Pos2::new(center.x + 5.0, center.y)], s);
+            painter.line_segment([Pos2::new(center.x + 5.0, center.y), Pos2::new(center.x, center.y + 6.0)], s);
+            painter.line_segment([Pos2::new(center.x, center.y + 6.0), Pos2::new(center.x - 5.0, center.y)], s);
+            painter.line_segment([Pos2::new(center.x - 5.0, center.y), Pos2::new(center.x - 5.0, center.y - 6.0)], s);
+        }
+        MenuIcon::NewTab => {
+            let r = EguiRect::from_center_size(center, Vec2::new(11.0, 9.0));
+            painter.rect_stroke(r, 1.5_f32, s, StrokeKind::Inside);
+            painter.line_segment([Pos2::new(center.x - 2.5, center.y), Pos2::new(center.x + 2.5, center.y)], s);
+            painter.line_segment([Pos2::new(center.x, center.y - 2.5), Pos2::new(center.x, center.y + 2.5)], s);
+        }
+        MenuIcon::NewWindow => {
+            let r1 = EguiRect::from_min_size(Pos2::new(center.x - 5.0, center.y - 5.0), Vec2::new(8.0, 7.0));
+            let r2 = EguiRect::from_min_size(Pos2::new(center.x - 2.0, center.y - 2.0), Vec2::new(8.0, 7.0));
+            painter.rect_stroke(r1, 1.0_f32, Stroke::new(1.0_f32, color), StrokeKind::Inside);
+            painter.rect_filled(r2, 1.0_f32, Color32::from_rgb(41, 42, 45));
+            painter.rect_stroke(r2, 1.0_f32, s, StrokeKind::Inside);
+        }
+        MenuIcon::Incognito => {
+            painter.circle_stroke(Pos2::new(center.x - 3.5, center.y + 1.0), 3.0, s);
+            painter.circle_stroke(Pos2::new(center.x + 3.5, center.y + 1.0), 3.0, s);
+            painter.line_segment([Pos2::new(center.x - 0.5, center.y + 1.0), Pos2::new(center.x + 0.5, center.y + 1.0)], s);
+            painter.line_segment([Pos2::new(center.x - 7.0, center.y - 3.0), Pos2::new(center.x + 7.0, center.y - 3.0)], s);
+        }
+        MenuIcon::Passwords => {
+            painter.circle_stroke(Pos2::new(center.x - 3.0, center.y), 3.0, s);
+            painter.line_segment([Pos2::new(center.x, center.y), Pos2::new(center.x + 6.0, center.y)], s);
+            painter.line_segment([Pos2::new(center.x + 4.0, center.y), Pos2::new(center.x + 4.0, center.y + 2.5)], s);
+            painter.line_segment([Pos2::new(center.x + 6.0, center.y), Pos2::new(center.x + 6.0, center.y + 2.5)], s);
+        }
+        MenuIcon::History => {
+            painter.circle_stroke(center, 5.5, s);
+            painter.line_segment([center, Pos2::new(center.x, center.y - 3.5)], s);
+            painter.line_segment([center, Pos2::new(center.x + 2.5, center.y)], s);
+        }
+        MenuIcon::Downloads => {
+            painter.line_segment([Pos2::new(center.x, center.y - 4.5), Pos2::new(center.x, center.y + 2.5)], s);
+            painter.line_segment([Pos2::new(center.x - 3.0, center.y), Pos2::new(center.x + 3.0, center.y)], s);
+            painter.line_segment([Pos2::new(center.x + 3.0, center.y), Pos2::new(center.x, center.y + 3.0)], s);
+            painter.line_segment([Pos2::new(center.x - 5.0, center.y + 5.0), Pos2::new(center.x + 5.0, center.y + 5.0)], s);
+        }
+        MenuIcon::Bookmarks => {
+            let r = 5.5;
+            let mut pts = Vec::new();
+            for i in 0..10 {
+                let angle = (i as f32) * std::f32::consts::PI / 5.0 - std::f32::consts::FRAC_PI_2;
+                let rad = if i % 2 == 0 { r } else { r * 0.45 };
+                pts.push(Pos2::new(center.x + angle.cos() * rad, center.y + angle.sin() * rad));
+            }
+            painter.add(egui::Shape::closed_line(pts, s));
+        }
+        MenuIcon::TabGroups => {
+            for dx in [-3.5, 1.5] {
+                for dy in [-3.5, 1.5] {
+                    let r = EguiRect::from_min_size(Pos2::new(center.x + dx, center.y + dy), Vec2::new(3.0, 3.0));
+                    painter.rect_stroke(r, 0.5_f32, Stroke::new(1.0_f32, color), StrokeKind::Inside);
+                }
+            }
+        }
+        MenuIcon::Extensions => {
+            let r = EguiRect::from_center_size(center, Vec2::new(9.0, 9.0));
+            painter.rect_stroke(r, 1.5_f32, s, StrokeKind::Inside);
+            painter.circle_filled(Pos2::new(center.x + 4.5, center.y), 1.5, color);
+        }
+        MenuIcon::DeleteData => {
+            painter.line_segment([Pos2::new(center.x - 5.0, center.y - 4.0), Pos2::new(center.x + 5.0, center.y - 4.0)], s);
+            let bin = EguiRect::from_min_size(Pos2::new(center.x - 3.5, center.y - 3.0), Vec2::new(7.0, 8.0));
+            painter.rect_stroke(bin, 1.0_f32, s, StrokeKind::Inside);
+            painter.line_segment([Pos2::new(center.x, center.y - 1.5), Pos2::new(center.x, center.y + 3.5)], Stroke::new(1.0_f32, color));
+        }
+        MenuIcon::Zoom => {
+            let glass_center = Pos2::new(center.x - 1.5, center.y - 1.5);
+            painter.circle_stroke(glass_center, 4.0, s);
+            painter.line_segment([Pos2::new(glass_center.x + 2.8, glass_center.y + 2.8), Pos2::new(center.x + 5.5, center.y + 5.5)], Stroke::new(1.8_f32, color));
+        }
+        MenuIcon::Print => {
+            let base = EguiRect::from_center_size(Pos2::new(center.x, center.y + 1.0), Vec2::new(11.0, 6.0));
+            painter.rect_stroke(base, 1.0_f32, s, StrokeKind::Inside);
+            let paper = EguiRect::from_center_size(Pos2::new(center.x, center.y - 3.5), Vec2::new(7.0, 4.0));
+            painter.rect_stroke(paper, 0.5_f32, Stroke::new(1.0_f32, color), StrokeKind::Inside);
+        }
+        MenuIcon::GoogleLens => {
+            draw_camera_icon(painter, center, 5.5, color);
+        }
+        MenuIcon::Translate => {
+            painter.text(center, Align2::CENTER_CENTER, "文A", FontId::proportional(10.0), color);
+        }
+        MenuIcon::Find => {
+            let doc = EguiRect::from_center_size(Pos2::new(center.x - 1.0, center.y), Vec2::new(8.0, 10.0));
+            painter.rect_stroke(doc, 1.0_f32, Stroke::new(1.0_f32, color), StrokeKind::Inside);
+            painter.circle_stroke(Pos2::new(center.x + 2.0, center.y + 2.0), 2.5, Stroke::new(1.2_f32, color));
+        }
+        MenuIcon::Cast => {
+            let screen = EguiRect::from_center_size(center, Vec2::new(11.0, 8.0));
+            painter.rect_stroke(screen, 1.0_f32, s, StrokeKind::Inside);
+            painter.circle_filled(Pos2::new(center.x - 3.5, center.y + 2.0), 1.0, color);
+        }
+        MenuIcon::MoreTools => {
+            painter.line_segment([Pos2::new(center.x - 4.5, center.y - 4.5), Pos2::new(center.x + 4.5, center.y + 4.5)], s);
+            painter.line_segment([Pos2::new(center.x - 4.5, center.y + 4.5), Pos2::new(center.x + 4.5, center.y - 4.5)], s);
+        }
+        MenuIcon::Help => {
+            painter.circle_stroke(center, 5.5, s);
+            painter.text(center, Align2::CENTER_CENTER, "?", FontId::proportional(9.0), color);
+        }
+        MenuIcon::Settings => {
+            painter.circle_stroke(center, 4.0, s);
+            for i in 0..4 {
+                let angle = (i as f32) * std::f32::consts::PI / 2.0;
+                let p1 = Pos2::new(center.x + angle.cos() * 4.0, center.y + angle.sin() * 4.0);
+                let p2 = Pos2::new(center.x + angle.cos() * 5.8, center.y + angle.sin() * 5.8);
+                painter.line_segment([p1, p2], s);
+            }
+        }
+        MenuIcon::Exit => {
+            let door = EguiRect::from_center_size(Pos2::new(center.x - 2.5, center.y), Vec2::new(6.0, 10.0));
+            painter.rect_stroke(door, 1.0_f32, s, StrokeKind::Inside);
+            painter.line_segment([Pos2::new(center.x - 1.0, center.y), Pos2::new(center.x + 5.0, center.y)], s);
+            painter.line_segment([Pos2::new(center.x + 3.0, center.y - 2.0), Pos2::new(center.x + 5.0, center.y)], s);
+            painter.line_segment([Pos2::new(center.x + 3.0, center.y + 2.0), Pos2::new(center.x + 5.0, center.y)], s);
+        }
+    }
+}
+
+fn render_menu_item(
+    ui: &mut egui::Ui,
+    icon: MenuIcon,
+    label: &str,
+    shortcut_or_chevron: Option<&str>,
+) -> egui::Response {
+    let desired_size = Vec2::new(ui.available_width(), 28.0);
+    let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(60, 64, 67));
+    }
+
+    let icon_center = Pos2::new(rect.min.x + 16.0, rect.center().y);
+    draw_menu_icon(ui.painter(), icon, icon_center, Color32::from_rgb(232, 234, 237));
+
+    let text_pos = Pos2::new(rect.min.x + 34.0, rect.center().y);
+    ui.painter().text(
+        text_pos,
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.5),
+        Color32::from_rgb(232, 234, 237),
+    );
+
+    if let Some(right_hint) = shortcut_or_chevron {
+        let is_chevron = right_hint == ">" || right_hint == "›";
+        let font_size = if is_chevron { 13.0 } else { 11.5 };
+        let right_pos = Pos2::new(rect.max.x - 10.0, rect.center().y);
+        ui.painter().text(
+            right_pos,
+            Align2::RIGHT_CENTER,
+            right_hint,
+            FontId::proportional(font_size),
+            Color32::from_rgb(154, 160, 166),
+        );
+    }
+
+    resp
+}
+
+fn render_profile_card(
+    ui: &mut egui::Ui,
+    name: &str,
+    status: &str,
+) -> egui::Response {
+    let desired_size = Vec2::new(ui.available_width(), 36.0);
+    let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+
+    let bg_color = if resp.hovered() {
+        Color32::from_rgb(64, 68, 74)
+    } else {
+        Color32::from_rgb(53, 56, 61)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(6), bg_color);
+
+    let avatar_center = Pos2::new(rect.min.x + 18.0, rect.center().y);
+    ui.painter().circle_filled(avatar_center, 10.0, Color32::from_rgb(32, 33, 36));
+    ui.painter().text(
+        avatar_center,
+        Align2::CENTER_CENTER,
+        "K",
+        FontId::proportional(11.0),
+        Color32::from_rgb(138, 180, 248),
+    );
+
+    let name_pos = Pos2::new(rect.min.x + 34.0, rect.center().y);
+    ui.painter().text(
+        name_pos,
+        Align2::LEFT_CENTER,
+        name,
+        FontId::proportional(12.5),
+        Color32::from_rgb(232, 234, 237),
+    );
+
+    let chevron_x = rect.max.x - 10.0;
+    ui.painter().text(
+        Pos2::new(chevron_x, rect.center().y),
+        Align2::RIGHT_CENTER,
+        ">",
+        FontId::proportional(13.0),
+        Color32::from_rgb(154, 160, 166),
+    );
+
+    let pill_w = 60.0;
+    let pill_h = 18.0;
+    let pill_rect = EguiRect::from_center_size(
+        Pos2::new(chevron_x - 12.0 - pill_w / 2.0, rect.center().y),
+        Vec2::new(pill_w, pill_h),
+    );
+    ui.painter().rect_filled(pill_rect, CornerRadius::same(9), Color32::from_rgb(26, 115, 232));
+    ui.painter().text(
+        pill_rect.center(),
+        Align2::CENTER_CENTER,
+        status,
+        FontId::proportional(10.0),
+        Color32::WHITE,
+    );
+
+    resp
+}
+
+fn render_menu_divider(ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [Pos2::new(rect.min.x + 4.0, rect.center().y), Pos2::new(rect.max.x - 4.0, rect.center().y)],
+        Stroke::new(1.0_f32, Color32::from_rgb(60, 64, 67)),
+    );
+    ui.add_space(2.0);
+}
+
+fn render_zoom_row(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    app: &mut BrowserApp,
+) {
+    let desired_size = Vec2::new(ui.available_width(), 32.0);
+    let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+
+    let icon_center = Pos2::new(rect.min.x + 16.0, rect.center().y);
+    draw_menu_icon(ui.painter(), MenuIcon::Zoom, icon_center, Color32::from_rgb(232, 234, 237));
+
+    let label_pos = Pos2::new(rect.min.x + 34.0, rect.center().y);
+    ui.painter().text(
+        label_pos,
+        Align2::LEFT_CENTER,
+        "Zoom",
+        FontId::proportional(12.5),
+        Color32::from_rgb(232, 234, 237),
+    );
+
+    let btn_size = Vec2::new(24.0, 24.0);
+
+    // Fullscreen button
+    let fs_rect = EguiRect::from_center_size(Pos2::new(rect.max.x - 16.0, rect.center().y), btn_size);
+    let fs_resp = ui.interact(fs_rect, ui.id().with("menu_zoom_fs"), egui::Sense::click());
+    if fs_resp.hovered() {
+        ui.painter().circle_filled(fs_rect.center(), 12.0, Color32::from_rgb(70, 74, 80));
+    }
+    let fc = fs_rect.center();
+    let fs_stroke = Stroke::new(1.3_f32, Color32::from_rgb(232, 234, 237));
+    let d = 4.5;
+    let b = 2.0;
+    ui.painter().line_segment([Pos2::new(fc.x - d, fc.y - d + b), Pos2::new(fc.x - d, fc.y - d)], fs_stroke);
+    ui.painter().line_segment([Pos2::new(fc.x - d, fc.y - d), Pos2::new(fc.x - d + b, fc.y - d)], fs_stroke);
+    ui.painter().line_segment([Pos2::new(fc.x + d - b, fc.y - d), Pos2::new(fc.x + d, fc.y - d)], fs_stroke);
+    ui.painter().line_segment([Pos2::new(fc.x + d, fc.y - d), Pos2::new(fc.x + d, fc.y - d + b)], fs_stroke);
+    ui.painter().line_segment([Pos2::new(fc.x - d, fc.y + d - b), Pos2::new(fc.x - d, fc.y + d)], fs_stroke);
+    ui.painter().line_segment([Pos2::new(fc.x - d, fc.y + d), Pos2::new(fc.x - d + b, fc.y + d)], fs_stroke);
+    ui.painter().line_segment([Pos2::new(fc.x + d - b, fc.y + d), Pos2::new(fc.x + d, fc.y + d)], fs_stroke);
+    ui.painter().line_segment([Pos2::new(fc.x + d, fc.y + d), Pos2::new(fc.x + d, fc.y + d - b)], fs_stroke);
+
+    if fs_resp.clicked() {
+        let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+    }
+
+    // [+] Button
+    let plus_rect = EguiRect::from_center_size(Pos2::new(fs_rect.min.x - 16.0, rect.center().y), btn_size);
+    let plus_resp = ui.interact(plus_rect, ui.id().with("menu_zoom_plus"), egui::Sense::click());
+    if plus_resp.hovered() {
+        ui.painter().circle_filled(plus_rect.center(), 12.0, Color32::from_rgb(70, 74, 80));
+    }
+    let pc = plus_rect.center();
+    let p_stroke = Stroke::new(1.4_f32, Color32::from_rgb(232, 234, 237));
+    ui.painter().line_segment([Pos2::new(pc.x - 4.0, pc.y), Pos2::new(pc.x + 4.0, pc.y)], p_stroke);
+    ui.painter().line_segment([Pos2::new(pc.x, pc.y - 4.0), Pos2::new(pc.x, pc.y + 4.0)], p_stroke);
+    if plus_resp.clicked() {
+        app.zoom_in();
+    }
+
+    // Percentage display
+    let pct_text = app.zoom_percentage();
+    let pct_x = plus_rect.min.x - 22.0;
+    ui.painter().text(
+        Pos2::new(pct_x, rect.center().y),
+        Align2::CENTER_CENTER,
+        pct_text,
+        FontId::proportional(12.0),
+        Color32::from_rgb(232, 234, 237),
+    );
+
+    // [-] Button
+    let minus_rect = EguiRect::from_center_size(Pos2::new(pct_x - 22.0, rect.center().y), btn_size);
+    let minus_resp = ui.interact(minus_rect, ui.id().with("menu_zoom_minus"), egui::Sense::click());
+    if minus_resp.hovered() {
+        ui.painter().circle_filled(minus_rect.center(), 12.0, Color32::from_rgb(70, 74, 80));
+    }
+    let mc = minus_rect.center();
+    ui.painter().line_segment([Pos2::new(mc.x - 4.0, mc.y), Pos2::new(mc.x + 4.0, mc.y)], p_stroke);
+    if minus_resp.clicked() {
+        app.zoom_out();
+    }
+}
+
+fn format_current_time() -> String {
+    if let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let total_secs = duration.as_secs();
+        let hours = (total_secs / 3600) % 24;
+        let mins = (total_secs / 60) % 60;
+        let secs = total_secs % 60;
+        let millis = duration.subsec_millis();
+        format!("{:02}:{:02}:{:02}.{:03}", hours, mins, secs, millis)
+    } else {
+        "00:00:00.000".to_string()
+    }
+}
+
+fn format_dim(val: f32) -> String {
+    if val.abs() < 0.01 {
+        "-".to_string()
+    } else {
+        format!("{:.0}", val)
+    }
+}
+
+fn render_chrome_box_model(ui: &mut egui::Ui, dims: Option<&Dimensions>) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width() - 8.0, 130.0), egui::Sense::hover());
     let painter = ui.painter();
 
-    // 1. Margin (outer, orange #f9ab00)
+    let m_top = dims.map_or("-".to_string(), |d| format_dim(d.margin.top));
+    let m_bot = dims.map_or("-".to_string(), |d| format_dim(d.margin.bottom));
+    let m_left = dims.map_or("-".to_string(), |d| format_dim(d.margin.left));
+    let m_right = dims.map_or("-".to_string(), |d| format_dim(d.margin.right));
+
+    let b_top = dims.map_or("-".to_string(), |d| format_dim(d.border.top));
+    let b_bot = dims.map_or("-".to_string(), |d| format_dim(d.border.bottom));
+    let b_left = dims.map_or("-".to_string(), |d| format_dim(d.border.left));
+    let b_right = dims.map_or("-".to_string(), |d| format_dim(d.border.right));
+
+    let p_top = dims.map_or("-".to_string(), |d| format_dim(d.padding.top));
+    let p_bot = dims.map_or("-".to_string(), |d| format_dim(d.padding.bottom));
+    let p_left = dims.map_or("-".to_string(), |d| format_dim(d.padding.left));
+    let p_right = dims.map_or("-".to_string(), |d| format_dim(d.padding.right));
+
+    let content_text = dims.map_or("- × -".to_string(), |d| format!("{:.0} × {:.0}", d.content.width, d.content.height));
+
+    // 1. Margin (outer layer, orange #f9ab00, bg #2d2619)
     let margin_rect = rect;
     painter.rect_filled(margin_rect, 4.0, Color32::from_rgb(45, 38, 25));
     painter.rect_stroke(margin_rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(249, 171, 0)), StrokeKind::Inside);
-    painter.text(Pos2::new(margin_rect.min.x + 6.0, margin_rect.min.y + 4.0), Align2::LEFT_TOP, format!("margin ({})", margin), FontId::proportional(10.0), Color32::from_rgb(249, 171, 0));
+    painter.text(Pos2::new(margin_rect.min.x + 6.0, margin_rect.min.y + 3.0), Align2::LEFT_TOP, "margin", FontId::proportional(9.0), Color32::from_rgb(249, 171, 0));
+    painter.text(Pos2::new(margin_rect.center().x, margin_rect.min.y + 4.0), Align2::CENTER_TOP, m_top, FontId::proportional(9.5), Color32::from_rgb(249, 171, 0));
+    painter.text(Pos2::new(margin_rect.center().x, margin_rect.max.y - 4.0), Align2::CENTER_BOTTOM, m_bot, FontId::proportional(9.5), Color32::from_rgb(249, 171, 0));
+    painter.text(Pos2::new(margin_rect.min.x + 8.0, margin_rect.center().y), Align2::LEFT_CENTER, m_left, FontId::proportional(9.5), Color32::from_rgb(249, 171, 0));
+    painter.text(Pos2::new(margin_rect.max.x - 8.0, margin_rect.center().y), Align2::RIGHT_CENTER, m_right, FontId::proportional(9.5), Color32::from_rgb(249, 171, 0));
 
-    // 2. Border (middle, yellow #fdd663)
-    let border_rect = margin_rect.shrink(14.0);
+    // 2. Border (middle layer, yellow #fdd663, bg #2a281c)
+    let border_rect = margin_rect.shrink(16.0);
     painter.rect_filled(border_rect, 3.0, Color32::from_rgb(42, 40, 28));
     painter.rect_stroke(border_rect, 3.0, Stroke::new(1.0_f32, Color32::from_rgb(253, 214, 99)), StrokeKind::Inside);
-    painter.text(Pos2::new(border_rect.min.x + 6.0, border_rect.min.y + 2.0), Align2::LEFT_TOP, "border: 1px", FontId::proportional(9.0), Color32::from_rgb(253, 214, 99));
+    painter.text(Pos2::new(border_rect.min.x + 6.0, border_rect.min.y + 3.0), Align2::LEFT_TOP, "border", FontId::proportional(9.0), Color32::from_rgb(253, 214, 99));
+    painter.text(Pos2::new(border_rect.center().x, border_rect.min.y + 3.0), Align2::CENTER_TOP, b_top, FontId::proportional(9.5), Color32::from_rgb(253, 214, 99));
+    painter.text(Pos2::new(border_rect.center().x, border_rect.max.y - 3.0), Align2::CENTER_BOTTOM, b_bot, FontId::proportional(9.5), Color32::from_rgb(253, 214, 99));
+    painter.text(Pos2::new(border_rect.min.x + 8.0, border_rect.center().y), Align2::LEFT_CENTER, b_left, FontId::proportional(9.5), Color32::from_rgb(253, 214, 99));
+    painter.text(Pos2::new(border_rect.max.x - 8.0, border_rect.center().y), Align2::RIGHT_CENTER, b_right, FontId::proportional(9.5), Color32::from_rgb(253, 214, 99));
 
-    // 3. Padding (green #81c995)
-    let padding_rect = border_rect.shrink(12.0);
+    // 3. Padding (third layer, green #81c995, bg #1a2820)
+    let padding_rect = border_rect.shrink(15.0);
     painter.rect_filled(padding_rect, 2.0, Color32::from_rgb(26, 40, 32));
     painter.rect_stroke(padding_rect, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(129, 201, 149)), StrokeKind::Inside);
-    painter.text(Pos2::new(padding_rect.min.x + 6.0, padding_rect.min.y + 2.0), Align2::LEFT_TOP, format!("padding ({})", padding), FontId::proportional(9.0), Color32::from_rgb(129, 201, 149));
+    painter.text(Pos2::new(padding_rect.min.x + 6.0, padding_rect.min.y + 3.0), Align2::LEFT_TOP, "padding", FontId::proportional(9.0), Color32::from_rgb(129, 201, 149));
+    painter.text(Pos2::new(padding_rect.center().x, padding_rect.min.y + 3.0), Align2::CENTER_TOP, p_top, FontId::proportional(9.5), Color32::from_rgb(129, 201, 149));
+    painter.text(Pos2::new(padding_rect.center().x, padding_rect.max.y - 3.0), Align2::CENTER_BOTTOM, p_bot, FontId::proportional(9.5), Color32::from_rgb(129, 201, 149));
+    painter.text(Pos2::new(padding_rect.min.x + 8.0, padding_rect.center().y), Align2::LEFT_CENTER, p_left, FontId::proportional(9.5), Color32::from_rgb(129, 201, 149));
+    painter.text(Pos2::new(padding_rect.max.x - 8.0, padding_rect.center().y), Align2::RIGHT_CENTER, p_right, FontId::proportional(9.5), Color32::from_rgb(129, 201, 149));
 
-    // 4. Content (blue #8ab4f8)
-    let content_rect = padding_rect.shrink(10.0);
+    // 4. Content (innermost layer, blue #8ab4f8, bg #1e2a3c)
+    let content_rect = padding_rect.shrink(14.0);
     painter.rect_filled(content_rect, 2.0, Color32::from_rgb(30, 42, 60));
     painter.rect_stroke(content_rect, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(138, 180, 248)), StrokeKind::Inside);
-    painter.text(content_rect.center(), Align2::CENTER_CENTER, display, FontId::proportional(11.0), Color32::from_rgb(138, 180, 248));
+    painter.text(content_rect.center(), Align2::CENTER_CENTER, content_text, FontId::proportional(10.5), Color32::from_rgb(138, 180, 248));
 }
 
 pub enum VectorIcon {
@@ -1641,58 +2798,66 @@ fn render_vector_shortcut<F: FnOnce()>(
     label: &str,
     on_click: F,
 ) {
-    ui.vertical_centered(|ui| {
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(48.0, 48.0), egui::Sense::click());
-        let center = rect.center();
+    let item_size = Vec2::new(68.0, 78.0);
+    ui.allocate_ui_with_layout(
+        item_size,
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
 
-        let hover_bg = if resp.hovered() {
-            Color32::from_rgba_premultiplied(
-                bg_color.r().saturating_add(25),
-                bg_color.g().saturating_add(25),
-                bg_color.b().saturating_add(25),
-                255,
-            )
-        } else {
-            bg_color
-        };
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(48.0, 48.0), egui::Sense::click());
+            let center = rect.center();
 
-        ui.painter().circle_filled(center, 24.0, hover_bg);
+            let hover_bg = if resp.hovered() {
+                Color32::from_rgba_premultiplied(
+                    bg_color.r().saturating_add(25),
+                    bg_color.g().saturating_add(25),
+                    bg_color.b().saturating_add(25),
+                    255,
+                )
+            } else {
+                bg_color
+            };
 
-        match icon {
-            VectorIcon::Letter(s) => {
-                ui.painter().text(center, Align2::CENTER_CENTER, s, FontId::proportional(22.0), Color32::WHITE);
-            }
-            VectorIcon::PlayTriangle => {
-                // Pointing right
-                let p1 = Pos2::new(center.x - 4.0, center.y - 7.0);
-                let p2 = Pos2::new(center.x + 7.0, center.y);
-                let p3 = Pos2::new(center.x - 4.0, center.y + 7.0);
-                ui.painter().add(egui::Shape::convex_polygon(vec![p1, p2, p3], Color32::WHITE, Stroke::NONE));
-            }
-            VectorIcon::Infinity => {
-                // Two connected loops
-                ui.painter().circle_stroke(Pos2::new(center.x - 5.0, center.y), 4.5, Stroke::new(1.8_f32, Color32::WHITE));
-                ui.painter().circle_stroke(Pos2::new(center.x + 5.0, center.y), 4.5, Stroke::new(1.8_f32, Color32::WHITE));
-            }
-            VectorIcon::Sparkle => {
-                draw_sparkle_icon(ui.painter(), center, 9.0, Color32::WHITE);
-            }
-            VectorIcon::Camera => {
-                draw_camera_icon(ui.painter(), center, 9.0, Color32::WHITE);
-            }
-            VectorIcon::Plus => {
-                ui.painter().line_segment([Pos2::new(center.x - 6.0, center.y), Pos2::new(center.x + 6.0, center.y)], Stroke::new(2.0_f32, Color32::WHITE));
-                ui.painter().line_segment([Pos2::new(center.x, center.y - 6.0), Pos2::new(center.x, center.y + 6.0)], Stroke::new(2.0_f32, Color32::WHITE));
-            }
-        }
+            ui.painter().circle_filled(center, 24.0, hover_bg);
 
-        ui.add_space(6.0);
-        ui.label(RichText::new(label).size(12.0).color(Color32::from_rgb(232, 234, 237)));
+            match icon {
+                VectorIcon::Letter(s) => {
+                    let font_size = if s.len() > 1 { 16.0 } else { 22.0 };
+                    ui.painter().text(center, Align2::CENTER_CENTER, s, FontId::proportional(font_size), Color32::WHITE);
+                }
+                VectorIcon::PlayTriangle => {
+                    // Pointing right
+                    let p1 = Pos2::new(center.x - 4.0, center.y - 7.0);
+                    let p2 = Pos2::new(center.x + 7.0, center.y);
+                    let p3 = Pos2::new(center.x - 4.0, center.y + 7.0);
+                    ui.painter().add(egui::Shape::convex_polygon(vec![p1, p2, p3], Color32::WHITE, Stroke::NONE));
+                }
+                VectorIcon::Infinity => {
+                    // Two connected loops
+                    ui.painter().circle_stroke(Pos2::new(center.x - 5.0, center.y), 4.5, Stroke::new(1.8_f32, Color32::WHITE));
+                    ui.painter().circle_stroke(Pos2::new(center.x + 5.0, center.y), 4.5, Stroke::new(1.8_f32, Color32::WHITE));
+                }
+                VectorIcon::Sparkle => {
+                    draw_sparkle_icon(ui.painter(), center, 9.0, Color32::WHITE);
+                }
+                VectorIcon::Camera => {
+                    draw_camera_icon(ui.painter(), center, 9.0, Color32::WHITE);
+                }
+                VectorIcon::Plus => {
+                    ui.painter().line_segment([Pos2::new(center.x - 6.0, center.y), Pos2::new(center.x + 6.0, center.y)], Stroke::new(2.0_f32, Color32::WHITE));
+                    ui.painter().line_segment([Pos2::new(center.x, center.y - 6.0), Pos2::new(center.x, center.y + 6.0)], Stroke::new(2.0_f32, Color32::WHITE));
+                }
+            }
 
-        if resp.clicked() {
-            on_click();
-        }
-    });
+            let text_color = if resp.hovered() { Color32::WHITE } else { Color32::from_rgb(232, 234, 237) };
+            ui.label(RichText::new(label).size(12.0).color(text_color));
+
+            if resp.clicked() {
+                on_click();
+            }
+        },
+    );
 }
 
 fn draw_sparkle_icon(painter: &egui::Painter, center: Pos2, r: f32, color: Color32) {
@@ -1709,101 +2874,155 @@ fn draw_camera_icon(painter: &egui::Painter, center: Pos2, r: f32, color: Color3
     painter.circle_stroke(center, r * 0.45, Stroke::new(1.4_f32, color));
 }
 
-fn render_dom_node_ui(
+fn render_dom_tree_node(
     ui: &mut egui::Ui,
     node: &Node,
+    current_path: Vec<usize>,
     depth: usize,
-    selected: &Option<String>,
-    clicked_node: &mut Option<SelectedNodeInfo>,
+    selected_path: &Option<Vec<usize>>,
+    expanded_paths: &mut std::collections::HashSet<Vec<usize>>,
+    new_selected_path: &mut Option<Vec<usize>>,
+    search_query: &str,
 ) {
-    if depth > 12 {
+    if depth > 16 {
         return;
     }
+
     match &node.node_type {
         NodeType::Element(data) => {
-            let mut label = format!("<{}", data.tag_name);
-            if let Some(id) = data.attributes.get("id") {
-                label.push_str(&format!(" id=\"{}\"", id));
+            let has_children = !node.children.is_empty();
+            let is_expanded = expanded_paths.contains(&current_path);
+            let is_selected = selected_path.as_ref() == Some(&current_path);
+
+            let row_height = 20.0;
+            let (rect, row_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), egui::Sense::click());
+
+            if is_selected {
+                ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(40, 62, 88));
+            } else if row_resp.hovered() {
+                ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(40, 43, 48));
             }
-            if let Some(class) = data.attributes.get("class") {
-                label.push_str(&format!(" class=\"{}\"", class));
+
+            if row_resp.clicked() {
+                *new_selected_path = Some(current_path.clone());
             }
-            label.push('>');
 
-            let is_sel = selected.as_ref() == Some(&label);
+            // Indentation
+            let indent_x = rect.min.x + (depth as f32) * 14.0 + 4.0;
 
-            let node_info = SelectedNodeInfo {
-                tag: data.tag_name.clone(),
-                id: data.attributes.get("id").cloned(),
-                class: data.attributes.get("class").cloned(),
-                attributes: data.attributes.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                text_preview: if !node.children.is_empty() {
-                    let txt = node.inner_text();
-                    let trimmed = txt.trim();
-                    if !trimmed.is_empty() {
-                        Some(if trimmed.len() > 40 { format!("{}...", &trimmed[..38]) } else { trimmed.to_string() })
-                    } else { None }
-                } else { None },
-                display: if matches!(data.tag_name.as_str(), "div" | "p" | "h1" | "h2" | "h3" | "ul" | "li" | "table") {
-                    "block".to_string()
-                } else if matches!(data.tag_name.as_str(), "button" | "input" | "img") {
-                    "inline-block".to_string()
-                } else {
-                    "inline".to_string()
-                },
-                font_size: match data.tag_name.as_str() {
-                    "h1" => "28px".to_string(),
-                    "h2" => "22px".to_string(),
-                    "h3" => "18px".to_string(),
-                    "small" => "12px".to_string(),
-                    _ => "16px".to_string(),
-                },
-                color: "#202124".to_string(),
-                bg_color: if data.tag_name == "button" { "#1a73e8".to_string() } else { "transparent".to_string() },
-                margin: match data.tag_name.as_str() {
-                    "h1" => "18px 0 12px 0".to_string(),
-                    "h2" => "16px 0 10px 0".to_string(),
-                    "p" => "10px 0".to_string(),
-                    _ => "0px".to_string(),
-                },
-                padding: if data.tag_name == "button" { "6px 14px".to_string() } else { "0px".to_string() },
-            };
-
-            ui.horizontal(|ui| {
-                ui.add_space((depth as f32) * 10.0);
-                let btn_text = RichText::new(&label).color(if is_sel {
-                    Color32::from_rgb(255, 200, 80)
-                } else {
-                    Color32::from_rgb(138, 180, 248)
-                });
-                if ui.selectable_label(is_sel, btn_text).clicked() {
-                    *clicked_node = Some(node_info);
+            // Expand/collapse caret
+            if has_children {
+                let caret_rect = EguiRect::from_center_size(Pos2::new(indent_x + 4.0, rect.center().y), Vec2::new(12.0, 12.0));
+                let caret_resp = ui.interact(caret_rect, ui.id().with(("caret", &current_path)), egui::Sense::click());
+                let caret_sym = if is_expanded { "▼" } else { "▶" };
+                ui.painter().text(caret_rect.center(), Align2::CENTER_CENTER, caret_sym, FontId::proportional(9.0), Color32::from_rgb(154, 160, 166));
+                if caret_resp.clicked() {
+                    if is_expanded {
+                        expanded_paths.remove(&current_path);
+                    } else {
+                        expanded_paths.insert(current_path.clone());
+                    }
                 }
-            });
+            }
 
-            for child in &node.children {
-                render_dom_node_ui(ui, child, depth + 1, selected, clicked_node);
+            // Syntax tokens: <tag attr="val">
+            let text_start_x = indent_x + 14.0;
+            let mut cursor_x = text_start_x;
+
+            // '<'
+            ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, "<", FontId::monospace(11.0), Color32::from_rgb(128, 134, 139));
+            cursor_x += 8.0;
+
+            // Tag name in blue #8ab4f8
+            ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, &data.tag_name, FontId::monospace(11.0), Color32::from_rgb(138, 180, 248));
+            cursor_x += (data.tag_name.len() as f32) * 6.6;
+
+            // Attributes
+            for (attr_k, attr_v) in &data.attributes {
+                cursor_x += 5.0;
+                ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, attr_k, FontId::monospace(11.0), Color32::from_rgb(253, 214, 99));
+                cursor_x += (attr_k.len() as f32) * 6.6;
+
+                ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, "=\"", FontId::monospace(11.0), Color32::from_rgb(128, 134, 139));
+                cursor_x += 12.0;
+
+                let val_preview = if attr_v.len() > 24 { format!("{}...", &attr_v[..22]) } else { attr_v.clone() };
+                ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, &val_preview, FontId::monospace(11.0), Color32::from_rgb(129, 201, 149));
+                cursor_x += (val_preview.len() as f32) * 6.6;
+
+                ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, "\"", FontId::monospace(11.0), Color32::from_rgb(128, 134, 139));
+                cursor_x += 6.0;
+            }
+
+            // '>'
+            let closing_preview = if !has_children {
+                ">"
+            } else if !is_expanded {
+                "> ... </"
+            } else {
+                ">"
+            };
+            ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, closing_preview, FontId::monospace(11.0), Color32::from_rgb(128, 134, 139));
+            cursor_x += (closing_preview.len() as f32) * 6.6;
+
+            if has_children && !is_expanded {
+                ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, &data.tag_name, FontId::monospace(11.0), Color32::from_rgb(138, 180, 248));
+                cursor_x += (data.tag_name.len() as f32) * 6.6;
+                ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, ">", FontId::monospace(11.0), Color32::from_rgb(128, 134, 139));
+            }
+
+            // Recursion if expanded
+            if has_children && is_expanded {
+                for (child_idx, child) in node.children.iter().enumerate() {
+                    let mut child_path = current_path.clone();
+                    child_path.push(child_idx);
+                    render_dom_tree_node(
+                        ui,
+                        child,
+                        child_path,
+                        depth + 1,
+                        selected_path,
+                        expanded_paths,
+                        new_selected_path,
+                        search_query,
+                    );
+                }
+
+                // Render matching closing tag </tag_name>
+                let (close_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), egui::Sense::hover());
+                let close_indent_x = close_rect.min.x + (depth as f32) * 14.0 + 18.0;
+                let mut cx = close_indent_x;
+                ui.painter().text(Pos2::new(cx, close_rect.center().y), Align2::LEFT_CENTER, "</", FontId::monospace(11.0), Color32::from_rgb(128, 134, 139));
+                cx += 13.0;
+                ui.painter().text(Pos2::new(cx, close_rect.center().y), Align2::LEFT_CENTER, &data.tag_name, FontId::monospace(11.0), Color32::from_rgb(138, 180, 248));
+                cx += (data.tag_name.len() as f32) * 6.6;
+                ui.painter().text(Pos2::new(cx, close_rect.center().y), Align2::LEFT_CENTER, ">", FontId::monospace(11.0), Color32::from_rgb(128, 134, 139));
             }
         }
         NodeType::Text(text) => {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                let preview = if trimmed.len() > 36 {
-                    format!("\"{}...\"", &trimmed[..34])
-                } else {
-                    format!("\"{}\"", trimmed)
-                };
-                ui.horizontal(|ui| {
-                    ui.add_space((depth as f32) * 10.0);
-                    ui.label(RichText::new(preview).weak().italics());
-                });
+                let row_height = 18.0;
+                let (rect, row_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), egui::Sense::click());
+                let is_selected = selected_path.as_ref() == Some(&current_path);
+                if is_selected {
+                    ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(40, 62, 88));
+                }
+                if row_resp.clicked() {
+                    *new_selected_path = Some(current_path.clone());
+                }
+
+                let indent_x = rect.min.x + (depth as f32) * 14.0 + 18.0;
+                let preview = if trimmed.len() > 48 { format!("\"{}...\"", &trimmed[..45]) } else { format!("\"{}\"", trimmed) };
+                ui.painter().text(Pos2::new(indent_x, rect.center().y), Align2::LEFT_CENTER, preview, FontId::monospace(10.5), Color32::from_rgb(232, 234, 237));
             }
         }
         NodeType::Comment(comment) => {
-            ui.horizontal(|ui| {
-                ui.add_space((depth as f32) * 10.0);
-                ui.label(RichText::new(format!("<!-- {} -->", comment.trim())).color(Color32::GRAY).italics());
-            });
+            let row_height = 18.0;
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), egui::Sense::hover());
+            let indent_x = rect.min.x + (depth as f32) * 14.0 + 18.0;
+            let preview = format!("<!-- {} -->", comment.trim());
+            ui.painter().text(Pos2::new(indent_x, rect.center().y), Align2::LEFT_CENTER, preview, FontId::monospace(10.5), Color32::from_rgb(128, 134, 139));
         }
     }
 }

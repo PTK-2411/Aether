@@ -164,3 +164,70 @@ fn test_autocomplete_delegation_matrix() {
         assert_eq!(normalized, expected_nav, "Query '{}' did not route to expected target", query);
     }
 }
+#[test]
+fn test_tab_and_window_geometry_polish() {
+    let app_source = std::fs::read_to_string("src/app.rs")
+        .expect("Failed to read src/app.rs");
+    let main_source = std::fs::read_to_string("src/main.rs")
+        .expect("Failed to read src/main.rs");
+
+    // 1. Tab title selection prevention: selectable(false) must be called on tab label
+    assert!(
+        app_source.contains(".selectable(false)"),
+        "Tab title label in src/app.rs must have .selectable(false) to prevent accidental text selection"
+    );
+
+    // 2. Tab 4-corner rounding: CornerRadius::same(8) must be used, old flat bottom (sw: 0, se: 0) removed
+    assert!(
+        app_source.contains("CornerRadius::same(8)"),
+        "Tab strip must use 4-corner rounded tab pills with CornerRadius::same(8)"
+    );
+    assert!(
+        !app_source.contains("sw: 0,\n                        se: 0,"),
+        "Old square bottom corners (sw: 0, se: 0) must be removed from tab strip in src/app.rs"
+    );
+
+    // 3. Main window transparency: ViewportBuilder with_transparent(true) and with_decorations(false)
+    assert!(
+        main_source.contains(".with_transparent(true)"),
+        "ViewportBuilder in src/main.rs must specify .with_transparent(true)"
+    );
+    assert!(
+        main_source.contains(".with_decorations(false)"),
+        "ViewportBuilder in src/main.rs must specify .with_decorations(false)"
+    );
+
+    // 4. Window frame clear color: transparent clear_color on BrowserApp
+    assert!(
+        app_source.contains("fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4]")
+            && app_source.contains("[0.0, 0.0, 0.0, 0.0]"),
+        "BrowserApp in src/app.rs must implement clear_color returning [0.0, 0.0, 0.0, 0.0]"
+    );
+
+    // 5. Outer window frame border stroke: 1px border stroke with Color32::from_rgb(60, 64, 67)
+    assert!(
+        app_source.contains("Color32::from_rgb(60, 64, 67)"),
+        "Window frame must render 1px outer stroke with Color32::from_rgb(60, 64, 67)"
+    );
+}
+
+#[test]
+fn test_tab_strip_tab_switching_and_management() {
+    let mut app = BrowserApp::new();
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.active_tab_idx, 0);
+
+    // Open second tab
+    app.open_new_tab("about:newtab".to_string());
+    assert_eq!(app.tabs.len(), 2);
+    assert_eq!(app.active_tab_idx, 1);
+
+    // Switch back to tab 0
+    app.active_tab_idx = 0;
+    assert_eq!(app.active_tab_idx, 0);
+
+    // Close tab 1
+    app.close_tab(1);
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.active_tab_idx, 0);
+}

@@ -504,3 +504,42 @@ pub fn estimate_text_width(text: &str, font_size: f32) -> f32 {
     }
     width.max(2.0)
 }
+
+/// DEVTOOLS: Recursively searches a LayoutBox tree for the box representing a target DOM Node.
+pub fn find_layout_box_for_node<'a, 'b>(
+    root: &'b LayoutBox<'a>,
+    target: &crate::dom::Node,
+) -> Option<&'b LayoutBox<'a>> {
+    if let Some(styled) = root.get_styled_node() {
+        if std::ptr::eq(styled.node, target) {
+            return Some(root);
+        }
+    }
+    for child in &root.children {
+        if let Some(found) = find_layout_box_for_node(child, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// DEVTOOLS: Computes the layout dimensions of a target DOM node within a given DOM tree and stylesheet.
+pub fn query_node_dimensions(
+    dom: &crate::dom::Node,
+    stylesheet: &crate::css::Stylesheet,
+    target: &crate::dom::Node,
+    width: f32,
+) -> Option<Dimensions> {
+    let styled_tree = crate::style::style_tree(dom, stylesheet);
+    if let Some(mut layout_box) = build_layout_tree(&styled_tree) {
+        let containing_block = Dimensions {
+            content: Rect::new(0.0, 0.0, width.max(300.0), 0.0),
+            padding: EdgeSizes::default(),
+            border: EdgeSizes::default(),
+            margin: EdgeSizes::default(),
+        };
+        layout_box.layout(containing_block);
+        return find_layout_box_for_node(&layout_box, target).map(|b| b.dimensions);
+    }
+    None
+}

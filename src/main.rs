@@ -48,7 +48,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size(Vec2::new(1280.0, 800.0))
             .with_min_inner_size(Vec2::new(800.0, 500.0))
             .with_title("Aether")
-            .with_decorations(false),
+            .with_decorations(false)
+            .with_transparent(true),
         ..Default::default()
     };
 

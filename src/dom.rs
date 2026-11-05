@@ -123,4 +123,32 @@ impl Node {
             child.find_all_by_tag(&tag_lower, out);
         }
     }
+
+    /// DEVTOOLS: Returns a reference to the descendant node at the specified path of child indices.
+    pub fn get_node_by_path<'a>(&'a self, path: &[usize]) -> Option<&'a Node> {
+        let mut current = self;
+        for &idx in path {
+            current = current.children.get(idx)?;
+        }
+        Some(current)
+    }
+
+    /// DEVTOOLS: Collects references to ancestor nodes along the path (from root down to immediate parent).
+    pub fn collect_ancestor_nodes<'a>(&'a self, path: &[usize]) -> Vec<&'a Node> {
+        let mut ancestors = Vec::new();
+        if path.is_empty() {
+            return ancestors;
+        }
+        let mut current = self;
+        ancestors.push(current);
+        for &idx in path.iter().take(path.len().saturating_sub(1)) {
+            if let Some(child) = current.children.get(idx) {
+                current = child;
+                ancestors.push(current);
+            } else {
+                break;
+            }
+        }
+        ancestors
+    }
 }

@@ -17,7 +17,7 @@ pub struct StyledNode<'a> {
     pub children: Vec<StyledNode<'a>>,
 }
 
-type MatchedRule<'a> = (Specificity, &'a Rule);
+pub type MatchedRule<'a> = (Specificity, &'a Rule);
 
 impl<'a> StyledNode<'a> {
     pub fn value(&self, name: &str) -> Option<&Value> {
@@ -236,7 +236,7 @@ fn specified_values(
     let mut rules = matching_rules(node, ancestors, stylesheet);
 
     // Sort by specificity: lowest first so higher specificity overrides
-    rules.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
+    rules.sort_by_key(|&(a, _)| a);
 
     for (_, rule) in rules {
         for declaration in &rule.declarations {
@@ -268,6 +268,24 @@ fn matching_rules<'a>(
         .iter()
         .filter_map(|rule| match_rule(node, ancestors, rule))
         .collect()
+}
+
+/// DEVTOOLS: Returns all CSS rules matching the given node within the stylesheet.
+pub fn get_matched_rules<'a>(
+    node: &Node,
+    ancestors: &[&Node],
+    stylesheet: &'a Stylesheet,
+) -> Vec<MatchedRule<'a>> {
+    matching_rules(node, ancestors, stylesheet)
+}
+
+/// DEVTOOLS: Computes the specified style property map for a given node.
+pub fn get_specified_values(
+    node: &Node,
+    ancestors: &[&Node],
+    stylesheet: &Stylesheet,
+) -> HashMap<String, Value> {
+    specified_values(node, ancestors, stylesheet)
 }
 
 fn match_rule<'a>(
