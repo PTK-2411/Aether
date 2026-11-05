@@ -229,3 +229,52 @@ fn test_stress_and_security_payloads() {
     let dots = ".".repeat(1000);
     assert!(normalize_url(&dots).starts_with("https://www.google.com/search?q=..."));
 }
+
+#[test]
+fn test_fuzz_and_invariant_stress() {
+    let charset: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:/?#-_&+=% \t\n\r!@$^&*()~`{}[]|;\"'<>,\\áéíóú漢字🚀"
+        .chars()
+        .collect();
+
+    // Deterministic pseudo-random number generator (LCG)
+    let mut state: u64 = 0xdeadbeefcafe;
+    let mut next_u32 = || -> u32 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 32) as u32
+    };
+
+    for _ in 0..10_000 {
+        let len = (next_u32() % 64) as usize;
+        let mut s = String::with_capacity(len);
+        for _ in 0..len {
+            let idx = (next_u32() as usize) % charset.len();
+            s.push(charset[idx]);
+        }
+
+        let normalized = normalize_url(&s);
+
+        // Invariant 1: normalize_url must never be empty
+        assert!(!normalized.is_empty(), "Normalized URL should never be empty for input: {:?}", s);
+
+        // Invariant 2: Result must always have a recognized valid scheme
+        let has_valid_scheme = normalized.starts_with("about:")
+            || normalized.starts_with("file://")
+            || normalized.starts_with("http://")
+            || normalized.starts_with("https://");
+
+        assert!(
+            has_valid_scheme,
+            "Normalized URL {:?} does not start with a valid scheme for input {:?}",
+            normalized, s
+        );
+
+        // Invariant 3: If routed to Google Search, query parameter must be present
+        if normalized.starts_with("https://www.google.com/search") {
+            assert!(
+                normalized.starts_with("https://www.google.com/search?q="),
+                "Google search URL must have ?q= prefix: {:?}",
+                normalized
+            );
+        }
+    }
+}
