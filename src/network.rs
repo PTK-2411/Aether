@@ -428,7 +428,7 @@ fn generate_aether_search_results(query: &str, url_str: &str) -> PageResponse {
         r#"<!DOCTYPE html>
 <html>
 <head>
-    <title>{} - Aether Search</title>
+    <title>{} - Google Search</title>
     <style>
         body {{
             font-family: sans-serif;
@@ -497,7 +497,7 @@ fn generate_aether_search_results(query: &str, url_str: &str) -> PageResponse {
 <body>
     <div class="content">
         <div class="brand-bar">
-            <span class="brand-logo">✦ Aether Search</span>
+            <span class="brand-logo">Google Search</span>
         </div>
         <div class="stats">{}</div>
 
@@ -516,7 +516,7 @@ fn generate_aether_search_results(query: &str, url_str: &str) -> PageResponse {
     PageResponse {
         url: url_str.to_string(),
         html,
-        title: format!("{} - Aether Search", query),
+        title: format!("{} - Google Search", query),
     }
 }
 

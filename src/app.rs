@@ -415,7 +415,7 @@ impl BrowserApp {
             self.search_suggestions.clear();
             self.show_omnibox_suggestions = false;
             self.show_center_suggestions = false;
-            self.navigate_active_tab(&format!("https://search.aether.local/?q={}", query));
+            self.navigate_active_tab(&query);
         }
     }
 }
@@ -885,7 +885,7 @@ impl BrowserApp {
             child_ui.add_space(6.0);
 
             // URL TextEdit
-            let available_edit_w = child_ui.available_width() - 85.0;
+            let available_edit_w = child_ui.available_width();
             let text_edit = child_ui.add_sized(
                 Vec2::new(available_edit_w.max(50.0), 24.0),
                 egui::TextEdit::singleline(&mut self.address_input)
@@ -907,40 +907,26 @@ impl BrowserApp {
                 self.navigate_active_tab(&target);
             }
 
-            // AI Mode pill inside Omnibox right side
-            child_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |child_ui| {
-                let ai_pill = child_ui.add(
-                    egui::Button::new(
-                        RichText::new("✦ AI Mode")
-                            .size(11.0)
-                            .color(Color32::from_rgb(168, 199, 250)),
-                    )
-                    .fill(Color32::from_rgb(48, 50, 54))
-                    .corner_radius(12)
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(95, 99, 104))),
-                );
-                if ai_pill.clicked() {
-                    self.navigate_active_tab("about:ai");
-                }
-            });
-
             // Right side of Toolbar: User profile avatar ("Hi, Khoa") and Menu ⋮
             ui.add_space(4.0);
 
-            // User profile pill: "Hi, Khoa" with clean vector avatar (NO emoji square box!)
-            let (p_rect, p_resp) = ui.allocate_exact_size(Vec2::new(82.0, 28.0), egui::Sense::click());
+            // Login button/pill routing to Google Accounts (replaces profile pill "Hi, Khoa")
+            let (p_rect, p_resp) = ui.allocate_exact_size(Vec2::new(64.0, 28.0), egui::Sense::click());
             if p_resp.hovered() {
                 ui.painter().rect_filled(p_rect, 14.0, Color32::from_rgb(52, 54, 58));
             } else {
                 ui.painter().rect_filled(p_rect, 14.0, Color32::from_rgb(40, 41, 44));
             }
             ui.painter().rect_stroke(p_rect, 14.0, Stroke::new(1.0_f32, Color32::from_rgb(68, 71, 70)), StrokeKind::Inside);
-            let avatar_center = Pos2::new(p_rect.min.x + 14.0, p_rect.center().y);
-            ui.painter().circle_filled(avatar_center, 8.0, Color32::from_rgb(26, 115, 232));
-            ui.painter().text(avatar_center, Align2::CENTER_CENTER, "K", FontId::proportional(10.0), Color32::WHITE);
-            ui.painter().text(Pos2::new(p_rect.min.x + 27.0, p_rect.center().y), Align2::LEFT_CENTER, "Hi, Khoa", FontId::proportional(11.0), Color32::from_rgb(232, 234, 237));
+            ui.painter().text(
+                p_rect.center(),
+                Align2::CENTER_CENTER,
+                "Login",
+                FontId::proportional(12.0),
+                Color32::from_rgb(232, 234, 237),
+            );
             if p_resp.clicked() {
-                self.show_devtools = !self.show_devtools;
+                self.navigate_active_tab("https://accounts.google.com");
             }
 
             // Menu button ⋮ (Vector 3 vertical dots, guaranteed 100% bug-free)
