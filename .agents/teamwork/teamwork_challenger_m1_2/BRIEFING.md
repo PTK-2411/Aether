@@ -1,4 +1,4 @@
-# BRIEFING — 2026-11-05T06:27:00Z
+# BRIEFING — 2026-11-05T06:33:00Z
 
 ## Mission
 Empirically verify UI cleanup in `src/app.rs` per original requirements and worker handoff, stress-test edge cases, run workspace tests, and deliver explicit verdict (APPROVE or REJECT).
@@ -26,18 +26,27 @@ Empirically verify UI cleanup in `src/app.rs` per original requirements and work
 - **Review criteria**: correctness, completeness, visual layout sanity, edge cases, tests pass
 
 ## Key Decisions Made
-- Initializing challenge process; will read baseline documents first.
+- Executed `cargo check` (0 errors, 0 warnings).
+- Created empirical test suite `tests/challenger_ui_tests.rs` verifying layout formulas, viewport responsiveness, source invariants, and autocomplete routing matrix.
+- Ran all 25 unit and integration tests across the workspace; all 25 passed.
+- Verdict: APPROVE.
 
 ## Artifact Index
 - `.agents/teamwork/teamwork_challenger_m1_2/DISPATCH.md` — Ingested dispatch message
 - `.agents/teamwork/teamwork_challenger_m1_2/BRIEFING.md` — Situational awareness
 - `.agents/teamwork/teamwork_challenger_m1_2/progress.md` — Liveness & status tracking
 - `.agents/teamwork/teamwork_challenger_m1_2/handoff.md` — Final challenge report
+- `tests/challenger_ui_tests.rs` — Empirical UI and layout test harness
 
 ## Attack Surface
-- **Hypotheses tested**: [TBD]
-- **Vulnerabilities found**: [TBD]
-- **Untested angles**: [TBD]
+- **Hypotheses tested**:
+  - Omnibox width underflow on small viewports (tested down to 100px; guarded by `.max(200.0)` and `.max(50.0)`).
+  - Shortcut centering underflow when window < 408px (guarded by `.max(0.0)`).
+  - Profile pill replaces "Hi, Khoa" and avatar "K" in toolbar with "Login" pill routing to `https://accounts.google.com` (confirmed).
+  - Autocomplete suggestion routing (confirmed routes to Google search or target URL via `navigate_active_tab`).
+  - Total absence of "✦ AI Mode", "100% Pure Rust Web Browser • Zero Chromium", action chips, "✦ Aether AI" link, and "Aether AI" shortcut circle (confirmed).
+- **Vulnerabilities found**: None.
+- **Untested angles**: DevTools DOM inspector rendering performance on 10,000+ node pages (out of scope for UI cleanup).
 
 ## Loaded Skills
 - None
