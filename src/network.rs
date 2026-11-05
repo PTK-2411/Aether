@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use url::Url;
@@ -45,6 +46,64 @@ impl NetworkManager {
     }
 }
 
+fn is_valid_domain_or_ip(trimmed: &str) -> bool {
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+
+    let authority = match trimmed.find(|c| c == '/' || c == '?' || c == '#') {
+        Some(idx) => &trimmed[..idx],
+        None => trimmed,
+    };
+
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host = match authority.rsplit_once(':') {
+        Some((h, port_str)) => {
+            if port_str.parse::<u16>().is_ok() {
+                h
+            } else {
+                return false;
+            }
+        }
+        None => authority,
+    };
+
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+
+    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+
+    for label in &labels {
+        if label.is_empty() {
+            return false;
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+    }
+
+    let tld = labels.last().unwrap();
+    if tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+
+    true
+}
+
 pub fn normalize_url(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -67,14 +126,19 @@ pub fn normalize_url(input: &str) -> String {
         return trimmed.to_string();
     }
 
-    // If it looks like a domain (e.g. "example.com" or "news.ycombinator.com")
-    if trimmed.contains('.') && !trimmed.contains(' ') {
+    // Localhost handling (e.g. "localhost", "localhost:8080", "localhost/dashboard")
+    if trimmed == "localhost" || trimmed.starts_with("localhost:") || trimmed.starts_with("localhost/") {
+        return format!("http://{}", trimmed);
+    }
+
+    // If it looks like a valid domain or IPv4 address, navigate directly via HTTPS
+    if is_valid_domain_or_ip(trimmed) {
         return format!("https://{}", trimmed);
     }
 
-    // Otherwise treat as search query on Aether Search
+    // Otherwise treat as search query on Google Search
     let encoded = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect::<String>();
-    format!("https://search.aether.local/?q={}", encoded)
+    format!("https://www.google.com/search?q={}", encoded)
 }
 
 pub fn resolve_relative_url(base_url: &str, href: &str) -> String {
