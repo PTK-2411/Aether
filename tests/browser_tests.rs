@@ -2,7 +2,7 @@ use rust_browser::css::{parse_color, CssColor, CssParser, Unit, Value};
 use rust_browser::html_parser::HtmlParser;
 use rust_browser::layout::{build_layout_tree, Dimensions, EdgeSizes, Rect};
 use rust_browser::network::{normalize_url, resolve_relative_url};
-use rust_browser::style::style_tree;
+use rust_browser::style::{style_tree, Display};
 
 #[test]
 fn test_html_parser_basic() {
@@ -460,4 +460,368 @@ fn test_protocol_relative_url_and_box_sizing() {
     // Content width must be 200 - 40(padding) - 10(border) = 150px
     assert_eq!(box_elem.dimensions.content.width, 150.0);
 }
+
+#[test]
+fn test_child_and_sibling_combinators() {
+    let css = r#"
+        div > p { color: #111111; }
+        h2 + p { color: #222222; }
+        h2 ~ span { color: #333333; }
+    "#;
+    let html = r#"
+        <div>
+            <p id="direct-child">Direct</p>
+            <section><p id="nested-child">Nested</p></section>
+            <h2>Heading</h2>
+            <p id="adjacent-p">Adjacent</p>
+            <p id="not-adjacent-p">Second</p>
+            <span id="sibling-span">Span</span>
+        </div>
+    "#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let find_color = |id: &str| -> Option<CssColor> {
+        fn search(node: &rust_browser::style::StyledNode, id: &str) -> Option<CssColor> {
+            if node.node.id() == Some(id) {
+                return Some(node.color(None));
+            }
+            for c in &node.children {
+                if let Some(col) = search(c, id) {
+                    return Some(col);
+                }
+            }
+            None
+        }
+        search(&styled, id)
+    };
+
+    assert_eq!(find_color("direct-child"), Some(CssColor::new(17, 17, 17, 255)));
+    assert_ne!(find_color("nested-child"), Some(CssColor::new(17, 17, 17, 255)));
+    assert_eq!(find_color("adjacent-p"), Some(CssColor::new(34, 34, 34, 255)));
+    assert_ne!(find_color("not-adjacent-p"), Some(CssColor::new(34, 34, 34, 255)));
+    assert_eq!(find_color("sibling-span"), Some(CssColor::new(51, 51, 51, 255)));
+}
+
+#[test]
+fn test_pseudo_elements_do_not_match_elements() {
+    let css = r#"
+        .heading::after { width: 10px; display: inline-block; }
+        .heading { width: 300px; display: block; }
+    "#;
+    let html = r#"<div class="heading">Heading Title</div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let heading = &styled.children[0];
+    assert_eq!(heading.display(), rust_browser::style::Display::Block);
+    // Heading element must NOT match the ::after pseudo-element rule!
+    let w = heading.value("width");
+    assert_eq!(w, Some(&Value::Length(300.0, Unit::Px)));
+}
+
+#[test]
+fn test_pseudo_classes_and_root() {
+    let css = r#"
+        :root { background-color: #123456; }
+        p:first-child { color: #ff0000; }
+        p:last-child { color: #0000ff; }
+    "#;
+    let html = r#"<html><body><div><p id="p1">First</p><p id="p2">Middle</p><p id="p3">Last</p></div></body></html>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    // Root (html) should have the background color
+    assert_eq!(styled.background_color(), CssColor::new(18, 52, 86, 255));
+
+    // Internal div should NOT match :root
+    let body = &styled.children[0];
+    let div = &body.children[0];
+    assert_ne!(div.background_color(), CssColor::new(18, 52, 86, 255));
+
+    let p1 = &div.children[0];
+    let p2 = &div.children[1];
+    let p3 = &div.children[2];
+
+    assert_eq!(p1.color(None), CssColor::new(255, 0, 0, 255));
+    assert_ne!(p2.color(None), CssColor::new(255, 0, 0, 255));
+    assert_eq!(p3.color(None), CssColor::new(0, 0, 255, 255));
+}
+
+#[test]
+fn test_css_variables_and_inheritance() {
+    let css = r#"
+        :root {
+            --brand-color: #e63946;
+            --brand-font-size: 24px;
+        }
+        .container {
+            color: var(--brand-color);
+            font-size: var(--brand-font-size);
+            background-color: var(--unspecified-bg, #f1faee);
+        }
+        .inner-text {
+            color: var(--brand-color);
+        }
+    "#;
+    let html = r#"<html><body><div class="container"><p class="inner-text">Hello</p></div></body></html>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let body = &styled.children[0];
+    let container = &body.children[0];
+    let inner = &container.children[0];
+
+    // Variables resolved on container
+    assert_eq!(container.color(None), CssColor::new(230, 57, 70, 255));
+    assert_eq!(container.font_size(None), 24.0);
+    assert_eq!(container.background_color(), CssColor::new(241, 250, 238, 255));
+
+    // Variable inherited and resolved on inner child
+    assert_eq!(inner.color(None), CssColor::new(230, 57, 70, 255));
+}
+
+#[test]
+fn test_css_grid_template_columns_layout() {
+    let css = r#"
+        .grid-container {
+            display: grid;
+            grid-template-columns: 200px 1fr;
+            width: 800px;
+        }
+        .sidebar { height: 100px; }
+        .main-content { height: 200px; }
+    "#;
+    let html = r#"<div class="grid-container"><div class="sidebar">Side</div><div class="main-content">Main</div></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 600.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let grid = &layout_root.children[0];
+    let sidebar = &grid.children[0];
+    let main = &grid.children[1];
+
+    assert_eq!(sidebar.dimensions.content.x, 0.0);
+    assert_eq!(sidebar.dimensions.content.width, 200.0);
+    assert_eq!(main.dimensions.content.x, 200.0);
+    assert_eq!(main.dimensions.content.width, 600.0);
+}
+
+#[test]
+fn test_absolute_positioning_and_out_of_flow() {
+    let css = r#"
+        .container { width: 500px; }
+        .jump-link { position: absolute; top: -9999px; left: 0px; height: 30px; }
+        .header { height: 60px; }
+    "#;
+    let html = r#"<div class="container"><div class="jump-link">Jump to content</div><div class="header">Header</div></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 0.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let container = &layout_root.children[0];
+    let jump_link = &container.children[0];
+    let header = &container.children[1];
+
+    // Jump link positioned offscreen
+    assert_eq!(jump_link.dimensions.content.y, -9999.0);
+    // Header must NOT be pushed down by the absolute jump link; starts at top (0.0)
+    assert_eq!(header.dimensions.content.y, 0.0);
+}
+
+#[test]
+fn test_hsl_and_hsla_colors() {
+    let css = r#"
+        .red { color: hsl(0, 100%, 50%); }
+        .green { color: hsl(120, 100%, 50%); }
+        .blue { color: hsl(240, 100%, 50%); }
+        .alpha { background-color: hsla(0, 100%, 50%, 0.5); }
+    "#;
+    let stylesheet = CssParser::parse(css);
+    let html = r#"<div><div class="red"></div><div class="green"></div><div class="blue"></div><div class="alpha"></div></div>"#;
+    let dom = HtmlParser::parse(html);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let red = &styled.children[0].children[0];
+    let green = &styled.children[0].children[1];
+    let blue = &styled.children[0].children[2];
+    let alpha = &styled.children[0].children[3];
+
+    assert_eq!(red.color(None), CssColor::new(255, 0, 0, 255));
+    assert_eq!(green.color(None), CssColor::new(0, 255, 0, 255));
+    assert_eq!(blue.color(None), CssColor::new(0, 0, 255, 255));
+    assert_eq!(alpha.background_color(), CssColor::new(255, 0, 0, 127));
+}
+
+#[test]
+fn test_calc_width_and_max_width() {
+    let css = r#"
+        .box-sub { width: calc(100% - 200px); }
+        .box-add { width: calc(200px + 50px); }
+    "#;
+    let html = r#"<div><div class="box-sub">Sub</div><div class="box-add">Add</div></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 0.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let parent = &layout_root.children[0];
+    let box_sub = &parent.children[0];
+    let box_add = &parent.children[1];
+
+    assert_eq!(box_sub.dimensions.content.width, 600.0);
+    assert_eq!(box_add.dimensions.content.width, 250.0);
+}
+
+#[test]
+fn test_absolute_positioning_translates_children() {
+    let css = r#"
+        .card { position: absolute; top: 120px; left: 80px; width: 300px; height: 100px; }
+    "#;
+    let html = r#"<div class="card"><p>Card Content</p></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 1024.0, 0.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let card = &layout_root.children[0];
+    let p = &card.children[0];
+    let text_fragment = &p.children[0];
+
+    // Card positioned at (80, 120)
+    assert_eq!(card.dimensions.content.x, 80.0);
+    assert_eq!(card.dimensions.content.y, 120.0);
+
+    // Child paragraph translated with parent card to (80, 120)
+    assert_eq!(p.dimensions.content.x, 80.0);
+    assert_eq!(p.dimensions.content.y, 120.0);
+
+    // Child text fragment also translated with parent card
+    assert_eq!(text_fragment.dimensions.content.x, 80.0);
+    assert_eq!(text_fragment.dimensions.content.y, 120.0);
+}
+
+#[test]
+fn test_inline_element_with_absolute_positioning() {
+    let css = r#"
+        a.jump-link { position: absolute; top: -9999px; left: 0px; }
+    "#;
+    let html = r##"<div><a class="jump-link" href="#main">Jump to content</a></div>"##;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let a_tag = &styled.children[0].children[0];
+    // Inline element with position: absolute computes to Block per CSS spec
+    assert_eq!(a_tag.display(), Display::Block);
+
+    let mut layout_root = build_layout_tree(&styled).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 0.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let parent = &layout_root.children[0];
+    let jump_box = &parent.children[0];
+    assert_eq!(jump_box.dimensions.content.y, -9999.0);
+
+    // All text children must also be translated offscreen
+    let text = &jump_box.children[0];
+    assert_eq!(text.dimensions.content.y, -9999.0);
+}
+
+#[test]
+fn test_font_size_percent_and_keywords() {
+    let css = r#"
+        .parent { font-size: 20px; }
+        .scaled { font-size: 150%; }
+        .small-kw { font-size: small; }
+    "#;
+    let html = r#"<div class="parent"><p class="scaled">Scaled</p><span class="small-kw">Small</span></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let parent = &styled.children[0];
+    let scaled = &parent.children[0];
+    let small_kw = &parent.children[1];
+
+    assert_eq!(parent.font_size(None), 20.0);
+    assert_eq!(scaled.font_size(Some(parent)), 30.0);
+    assert_eq!(small_kw.font_size(Some(parent)), 13.0);
+}
+
+#[test]
+fn test_background_and_border_with_css_variables() {
+    let css = r#"
+        :root {
+            --bg-base: #f8f9fa;
+            --border-clr: #a2a9b1;
+        }
+        .container {
+            background: var(--bg-base) url(/some/icon.svg) no-repeat;
+            border: 1px solid var(--border-clr);
+        }
+        .header {
+            background: #e9ecef none repeat;
+        }
+    "#;
+    let html = r#"<html><body><div class="container"><div class="header">Head</div></div></body></html>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let body = &styled.children[0];
+    let container = &body.children[0];
+    let header = &container.children[0];
+
+    // CSS variable extracted from multivalent background shorthand
+    assert_eq!(container.background_color(), CssColor::new(248, 249, 250, 255));
+    // Color extracted from shorthand with none repeat
+    assert_eq!(header.background_color(), CssColor::new(233, 236, 239, 255));
+    // Border color extracted from shorthand with CSS variable
+    assert_eq!(container.value("border-top-color"), Some(&Value::ColorValue(CssColor::new(162, 169, 177, 255))));
+}
+
 

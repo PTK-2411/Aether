@@ -339,6 +339,19 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
             if let Ok(css_resp) = client.get(&resolved).header("Accept", "text/css,*/*;q=0.1").send() {
                 if css_resp.status().is_success() {
                     if let Ok(css_text) = css_resp.text() {
+                        let nested_imports = extract_css_imports(&css_text);
+                        for imp in nested_imports {
+                            let imp_res = resolve_relative_url(&resolved, &imp);
+                            if imp_res.starts_with("http://") || imp_res.starts_with("https://") {
+                                if let Ok(n_resp) = client.get(&imp_res).header("Accept", "text/css,*/*;q=0.1").send() {
+                                    if n_resp.status().is_success() {
+                                        if let Ok(n_text) = n_resp.text() {
+                                            external_css.push(n_text);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         external_css.push(css_text);
                     }
                 }
@@ -358,6 +371,31 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
     })
 }
 
+fn extract_css_imports(css: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    let mut search_pos = 0;
+    let lower = css.to_ascii_lowercase();
+    while let Some(idx) = lower[search_pos..].find("@import") {
+        let start = search_pos + idx + 7;
+        let end = match css[start..].find(';') {
+            Some(i) => start + i,
+            None => break,
+        };
+        let slice = css[start..end].trim();
+        let url = if slice.starts_with("url(") && slice.ends_with(')') {
+            let inner = slice[4..slice.len() - 1].trim();
+            inner.trim_matches('"').trim_matches('\'').to_string()
+        } else {
+            slice.trim_matches('"').trim_matches('\'').to_string()
+        };
+        if !url.is_empty() {
+            imports.push(url);
+        }
+        search_pos = end + 1;
+    }
+    imports
+}
+
 fn extract_stylesheet_urls(html: &str) -> Vec<String> {
     let mut urls = Vec::new();
     let lower = html.to_ascii_lowercase();
@@ -369,44 +407,34 @@ fn extract_stylesheet_urls(html: &str) -> Vec<String> {
             None => break,
         };
         let tag_slice = &html[abs_start..=end_idx];
-        let tag_lower = tag_slice.to_ascii_lowercase();
 
-        if tag_lower.contains("rel=\"stylesheet\"")
-            || tag_lower.contains("rel='stylesheet'")
-            || tag_lower.contains("rel=stylesheet")
-            || (tag_lower.contains("as=\"style\"") && tag_lower.contains("rel=\"preload\""))
-        {
-            if let Some(href_val) = extract_attribute_value(tag_slice, "href") {
-                let decoded = crate::html_parser::HtmlParser::decode_string_entities(&href_val);
-                urls.push(decoded);
+        let mut tag_for_parser = tag_slice.to_string();
+        if !tag_for_parser.ends_with("/>") && tag_for_parser.ends_with('>') {
+            tag_for_parser.insert(tag_for_parser.len() - 1, '/');
+        }
+        let parsed = crate::html_parser::HtmlParser::parse(&tag_for_parser);
+        if let Some(link_node) = parsed.children.first() {
+            let rel = link_node.get_attribute("rel").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            let as_attr = link_node.get_attribute("as").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            let media = link_node.get_attribute("media").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+
+            // Ignore print-only stylesheets
+            let is_print_only = media.contains("print") && !media.contains("screen") && !media.contains("all");
+            let is_stylesheet = rel.split_whitespace().any(|r| r == "stylesheet")
+                || (rel.split_whitespace().any(|r| r == "preload") && as_attr == "style");
+
+            if is_stylesheet && !is_print_only {
+                if let Some(href_val) = link_node.get_attribute("href") {
+                    if !href_val.is_empty() {
+                        let decoded = crate::html_parser::HtmlParser::decode_string_entities(href_val);
+                        urls.push(decoded);
+                    }
+                }
             }
         }
         search_pos = end_idx + 1;
     }
     urls
-}
-
-fn extract_attribute_value(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let pattern = format!("{}=", attr);
-    if let Some(idx) = lower.find(&pattern) {
-        let after_eq = tag[idx + pattern.len()..].trim_start();
-        if after_eq.starts_with('"') {
-            if let Some(end) = after_eq[1..].find('"') {
-                return Some(after_eq[1..=end].to_string());
-            }
-        } else if after_eq.starts_with('\'') {
-            if let Some(end) = after_eq[1..].find('\'') {
-                return Some(after_eq[1..=end].to_string());
-            }
-        } else {
-            let val: String = after_eq.chars().take_while(|c| !c.is_whitespace() && *c != '>').collect();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 fn extract_title_or(html: &str, default_title: &str) -> String {

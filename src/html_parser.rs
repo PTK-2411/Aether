@@ -241,16 +241,25 @@ impl HtmlParser {
     }
 
     fn parse_raw_content(&mut self, tag_name: &str) -> String {
-        let closing = format!("</{}>", tag_name);
         let start = self.pos;
         while !self.eof() {
-            let remaining: String = self.input[self.pos..].iter().take(closing.len()).collect();
-            if remaining.eq_ignore_ascii_case(&closing) {
-                let content: String = self.input[start..self.pos].iter().collect();
-                for _ in 0..closing.len() {
-                    self.consume_char();
+            if self.starts_with("</") {
+                let check_pos = self.pos + 2;
+                let tag_len = tag_name.len();
+                if check_pos + tag_len <= self.input.len() {
+                    let maybe_tag: String = self.input[check_pos..check_pos + tag_len].iter().collect();
+                    if maybe_tag.eq_ignore_ascii_case(tag_name) {
+                        let mut after_pos = check_pos + tag_len;
+                        while after_pos < self.input.len() && self.input[after_pos].is_whitespace() {
+                            after_pos += 1;
+                        }
+                        if after_pos < self.input.len() && self.input[after_pos] == '>' {
+                            let content: String = self.input[start..self.pos].iter().collect();
+                            self.pos = after_pos + 1;
+                            return content;
+                        }
+                    }
                 }
-                return content;
             }
             self.consume_char();
         }

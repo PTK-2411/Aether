@@ -76,6 +76,56 @@ pub enum BoxType<'a> {
     AnonymousBlock,
 }
 
+fn eval_calc(expr: &str, base: f32) -> f32 {
+    let expr = expr.trim();
+    if let Some(pos) = expr.rfind(" - ") {
+        let left = eval_calc(&expr[..pos], base);
+        let right = eval_calc(&expr[pos + 3..], base);
+        return left - right;
+    }
+    if let Some(pos) = expr.rfind(" + ") {
+        let left = eval_calc(&expr[..pos], base);
+        let right = eval_calc(&expr[pos + 3..], base);
+        return left + right;
+    }
+    if let Some(pos) = expr.rfind(" * ") {
+        let left = eval_calc(&expr[..pos], base);
+        let right = expr[pos + 3..].trim().parse::<f32>().unwrap_or(1.0);
+        return left * right;
+    }
+    if let Some(pos) = expr.rfind(" / ") {
+        let left = eval_calc(&expr[..pos], base);
+        let right = expr[pos + 3..].trim().parse::<f32>().unwrap_or(1.0);
+        if right != 0.0 {
+            return left / right;
+        }
+        return left;
+    }
+
+    if let Some(val) = crate::css::parse_value_str(expr) {
+        parse_len_value(&val, base)
+    } else {
+        0.0
+    }
+}
+
+pub fn parse_len_value(v: &Value, base: f32) -> f32 {
+    match v {
+        Value::Length(px, Unit::Px) => *px,
+        Value::Length(pt, Unit::Pt) => *pt * 1.333,
+        Value::Length(em, Unit::Em) => *em * 16.0,
+        Value::Length(rem, Unit::Rem) => *rem * 16.0,
+        Value::Length(pct, Unit::Percent) => base * (*pct / 100.0),
+        Value::Length(vh, Unit::Vh) => 600.0 * (*vh / 100.0),
+        Value::Length(vw, Unit::Vw) => base * (*vw / 100.0),
+        Value::Number(n) => *n,
+        Value::Keyword(k) if k.starts_with("calc(") && k.ends_with(')') => {
+            eval_calc(&k[5..k.len() - 1], base)
+        }
+        _ => 0.0,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LayoutBox<'a> {
     pub dimensions: Dimensions,
@@ -100,15 +150,27 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
+    /// Recursively shifts this box and all its descendants by (dx, dy).
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        self.dimensions.content.x += dx;
+        self.dimensions.content.y += dy;
+        for child in &mut self.children {
+            child.translate(dx, dy);
+        }
+    }
+
     /// Performs standard CSS layout given the containing block dimensions.
     pub fn layout(&mut self, containing_block: Dimensions) {
-        let is_flex = self.get_styled_node().map(|s| s.display() == crate::style::Display::Flex).unwrap_or(false);
         match self.box_type {
             BoxType::BlockNode(_) | BoxType::AnonymousBlock => {
-                if is_flex {
-                    self.layout_flex(containing_block);
-                } else {
-                    self.layout_block(containing_block);
+                let display = self.get_styled_node().map(|s| s.display()).unwrap_or(crate::style::Display::Block);
+                match display {
+                    crate::style::Display::Flex => self.layout_flex(containing_block),
+                    crate::style::Display::Grid => self.layout_grid(containing_block),
+                    _ => self.layout_block(containing_block),
                 }
             }
             BoxType::InlineNode(_) | BoxType::ImageNode { .. } | BoxType::TextFragment { .. } => {
@@ -122,7 +184,74 @@ impl<'a> LayoutBox<'a> {
         self.calculate_block_position(containing_block);
         self.layout_block_children();
         self.calculate_block_height();
-        self.apply_relative_positioning();
+        self.apply_relative_and_absolute_positioning(containing_block);
+    }
+
+    fn layout_grid(&mut self, containing_block: Dimensions) {
+        self.calculate_block_width(containing_block);
+        self.calculate_block_position(containing_block);
+
+        let parent_w = self.dimensions.content.width.max(10.0);
+        let style = self.get_styled_node();
+
+        let cols_spec = style.and_then(|s| s.value("grid-template-columns")).map(|v| match v {
+            Value::Keyword(k) => k.as_str(),
+            Value::StringLiteral(s) => s.as_str(),
+            _ => "",
+        }).unwrap_or("");
+
+        let gap = style.and_then(|s| s.value("gap").or_else(|| s.value("column-gap"))).and_then(|v| match v {
+            Value::Length(px, Unit::Px) => Some(*px),
+            _ => None,
+        }).unwrap_or(0.0);
+
+        let column_widths = compute_grid_column_widths(cols_spec, parent_w, self.children.len(), gap);
+        let num_cols = column_widths.len().max(1);
+
+        let mut row_y = 0.0;
+        let mut row_max_h: f32 = 0.0;
+
+        let mut cell_idx = 0;
+        for child in &mut self.children {
+            let is_out_of_flow = child
+                .get_styled_node()
+                .and_then(|s| s.value("position"))
+                .map_or(false, |v| matches!(v, Value::Keyword(k) if k == "absolute" || k == "fixed"));
+
+            if is_out_of_flow {
+                let cb = Dimensions {
+                    content: Rect::new(self.dimensions.content.x, self.dimensions.content.y, parent_w, 0.0),
+                    padding: EdgeSizes::default(),
+                    border: EdgeSizes::default(),
+                    margin: EdgeSizes::default(),
+                };
+                child.layout(cb);
+                continue;
+            }
+
+            let col_idx = cell_idx % num_cols;
+            if col_idx == 0 && cell_idx > 0 {
+                row_y += row_max_h + gap;
+                row_max_h = 0.0;
+            }
+
+            let col_w = column_widths[col_idx];
+            let col_x: f32 = column_widths[..col_idx].iter().sum::<f32>() + (col_idx as f32 * gap);
+
+            let cb = Dimensions {
+                content: Rect::new(self.dimensions.content.x + col_x, self.dimensions.content.y + row_y, col_w, 0.0),
+                padding: EdgeSizes::default(),
+                border: EdgeSizes::default(),
+                margin: EdgeSizes::default(),
+            };
+            child.layout(cb);
+            row_max_h = row_max_h.max(child.dimensions.margin_box().height);
+            cell_idx += 1;
+        }
+
+        self.dimensions.content.height = row_y + row_max_h;
+        self.calculate_block_height();
+        self.apply_relative_and_absolute_positioning(containing_block);
     }
 
     fn layout_flex(&mut self, containing_block: Dimensions) {
@@ -135,31 +264,75 @@ impl<'a> LayoutBox<'a> {
             _ => "row",
         }).unwrap_or("row");
 
+        let gap = style.and_then(|s| s.value("gap").or_else(|| s.value("column-gap"))).and_then(|v| match v {
+            Value::Length(px, Unit::Px) => Some(*px),
+            _ => None,
+        }).unwrap_or(0.0);
+
         if direction == "column" {
             let mut y_offset = 0.0;
+            let mut flow_idx = 0;
             for child in &mut self.children {
+                let is_out_of_flow = child
+                    .get_styled_node()
+                    .and_then(|s| s.value("position"))
+                    .map_or(false, |v| matches!(v, Value::Keyword(k) if k == "absolute" || k == "fixed"));
+
+                if is_out_of_flow {
+                    let mut cb = self.dimensions;
+                    cb.content.height = 0.0;
+                    child.layout(cb);
+                    continue;
+                }
+
+                if flow_idx > 0 {
+                    y_offset += gap;
+                }
                 let mut cb = self.dimensions;
                 cb.content.height = y_offset;
                 child.layout(cb);
                 y_offset += child.dimensions.margin_box().height;
                 self.dimensions.content.height = y_offset;
+                flow_idx += 1;
             }
         } else {
             let parent_w = self.dimensions.content.width.max(10.0);
             let mut cur_x = 0.0;
             let mut max_h: f32 = 0.0;
             let total_children = self.children.len().max(1) as f32;
+            let total_gap = (self.children.len().saturating_sub(1) as f32) * gap;
+            let usable_w = (parent_w - total_gap).max(10.0);
+            let mut flow_idx = 0;
 
             for child in &mut self.children {
+                let is_out_of_flow = child
+                    .get_styled_node()
+                    .and_then(|s| s.value("position"))
+                    .map_or(false, |v| matches!(v, Value::Keyword(k) if k == "absolute" || k == "fixed"));
+
+                if is_out_of_flow {
+                    let cb = Dimensions {
+                        content: Rect::new(self.dimensions.content.x, self.dimensions.content.y, parent_w, 0.0),
+                        padding: EdgeSizes::default(),
+                        border: EdgeSizes::default(),
+                        margin: EdgeSizes::default(),
+                    };
+                    child.layout(cb);
+                    continue;
+                }
+
+                if flow_idx > 0 {
+                    cur_x += gap;
+                }
                 let item_w = child.get_styled_node().and_then(|s| s.value("width")).and_then(|w| match w {
                     Value::Length(px, Unit::Px) => Some(*px),
-                    Value::Length(pct, Unit::Percent) => Some(parent_w * (*pct / 100.0)),
+                    Value::Length(pct, Unit::Percent) => Some(usable_w * (*pct / 100.0)),
                     _ => None,
                 });
 
                 let available_w = item_w.unwrap_or_else(|| {
-                    let remaining = (parent_w - cur_x).max(20.0);
-                    remaining.min(parent_w / total_children)
+                    let remaining = (usable_w - cur_x).max(20.0);
+                    remaining.min(usable_w / total_children)
                 });
 
                 let cb = Dimensions {
@@ -173,29 +346,71 @@ impl<'a> LayoutBox<'a> {
                 let h = child.dimensions.margin_box().height;
                 cur_x += w;
                 max_h = max_h.max(h);
+                flow_idx += 1;
             }
 
             self.dimensions.content.height = max_h;
         }
 
         self.calculate_block_height();
-        self.apply_relative_positioning();
+        self.apply_relative_and_absolute_positioning(containing_block);
     }
 
-    fn apply_relative_positioning(&mut self) {
+    fn apply_relative_and_absolute_positioning(&mut self, containing_block: Dimensions) {
         if let Some(style) = self.get_styled_node() {
             if let Some(Value::Keyword(pos)) = style.value("position") {
-                if pos == "relative" {
-                    let parse_len = |v: &Value| -> f32 {
-                        match v {
-                            Value::Length(px, Unit::Px) => *px,
-                            _ => 0.0,
+                let parent_w = containing_block.content.width.max(0.0);
+                let parent_h = if containing_block.content.height > 0.0 {
+                    containing_block.content.height
+                } else {
+                    600.0
+                };
+
+                let old_x = self.dimensions.content.x;
+                let old_y = self.dimensions.content.y;
+
+                match pos.as_str() {
+                    "relative" => {
+                        let top = style.value("top").map(|v| parse_len_value(v, parent_h)).unwrap_or_else(|| {
+                            style.value("bottom").map(|v| -parse_len_value(v, parent_h)).unwrap_or(0.0)
+                        });
+                        let left = style.value("left").map(|v| parse_len_value(v, parent_w)).unwrap_or_else(|| {
+                            style.value("right").map(|v| -parse_len_value(v, parent_w)).unwrap_or(0.0)
+                        });
+                        self.dimensions.content.x += left;
+                        self.dimensions.content.y += top;
+                    }
+                    "absolute" | "fixed" => {
+                        if let Some(top_val) = style.value("top") {
+                            self.dimensions.content.y = containing_block.content.y + parse_len_value(top_val, parent_h);
+                        } else if let Some(bot_val) = style.value("bottom") {
+                            let specified_b = parse_len_value(bot_val, parent_h);
+                            self.dimensions.content.y = containing_block.content.y + parent_h - specified_b
+                                - self.dimensions.content.height
+                                - self.dimensions.padding.bottom
+                                - self.dimensions.border.bottom
+                                - self.dimensions.margin.bottom;
                         }
-                    };
-                    let top = style.value("top").map(parse_len).unwrap_or(0.0);
-                    let left = style.value("left").map(parse_len).unwrap_or(0.0);
-                    self.dimensions.content.x += left;
-                    self.dimensions.content.y += top;
+                        if let Some(left_val) = style.value("left") {
+                            self.dimensions.content.x = containing_block.content.x + parse_len_value(left_val, parent_w);
+                        } else if let Some(right_val) = style.value("right") {
+                            let specified_r = parse_len_value(right_val, parent_w);
+                            self.dimensions.content.x = containing_block.content.x + parent_w - specified_r
+                                - self.dimensions.content.width
+                                - self.dimensions.padding.right
+                                - self.dimensions.border.right
+                                - self.dimensions.margin.right;
+                        }
+                    }
+                    _ => {}
+                }
+
+                let dx = self.dimensions.content.x - old_x;
+                let dy = self.dimensions.content.y - old_y;
+                if dx != 0.0 || dy != 0.0 {
+                    for child in &mut self.children {
+                        child.translate(dx, dy);
+                    }
                 }
             }
         }
@@ -220,24 +435,10 @@ impl<'a> LayoutBox<'a> {
 
         let parent_width = containing_block.content.width.max(0.0);
 
-        let parse_len = |v: &Value, base: f32| -> f32 {
-            match v {
-                Value::Length(px, Unit::Px) => *px,
-                Value::Length(pt, Unit::Pt) => *pt * 1.333,
-                Value::Length(em, Unit::Em) => *em * 16.0,
-                Value::Length(rem, Unit::Rem) => *rem * 16.0,
-                Value::Length(pct, Unit::Percent) => base * (*pct / 100.0),
-                Value::Length(vh, Unit::Vh) => 600.0 * (*vh / 100.0),
-                Value::Length(vw, Unit::Vw) => base * (*vw / 100.0),
-                Value::Number(n) => *n,
-                _ => 0.0,
-            }
-        };
-
-        self.dimensions.border.left = parse_len(border_left, parent_width);
-        self.dimensions.border.right = parse_len(border_right, parent_width);
-        self.dimensions.padding.left = parse_len(padding_left, parent_width);
-        self.dimensions.padding.right = parse_len(padding_right, parent_width);
+        self.dimensions.border.left = parse_len_value(border_left, parent_width);
+        self.dimensions.border.right = parse_len_value(border_right, parent_width);
+        self.dimensions.padding.left = parse_len_value(padding_left, parent_width);
+        self.dimensions.padding.right = parse_len_value(padding_right, parent_width);
 
         let total_non_content = self.dimensions.border.left
             + self.dimensions.border.right
@@ -253,13 +454,13 @@ impl<'a> LayoutBox<'a> {
         let ml_is_auto = matches!(margin_left, Value::Keyword(k) if k == "auto");
         let mr_is_auto = matches!(margin_right, Value::Keyword(k) if k == "auto");
 
-        let mut specified_w = if w_is_auto { 0.0 } else { parse_len(width, parent_width) };
+        let mut specified_w = if w_is_auto { 0.0 } else { parse_len_value(width, parent_width) };
         if is_border_box && !w_is_auto {
             specified_w = (specified_w - total_non_content).max(0.0);
         }
 
-        let specified_ml = if ml_is_auto { 0.0 } else { parse_len(margin_left, parent_width) };
-        let specified_mr = if mr_is_auto { 0.0 } else { parse_len(margin_right, parent_width) };
+        let specified_ml = if ml_is_auto { 0.0 } else { parse_len_value(margin_left, parent_width) };
+        let specified_mr = if mr_is_auto { 0.0 } else { parse_len_value(margin_right, parent_width) };
 
         let sum = specified_w + total_non_content + specified_ml + specified_mr;
 
@@ -301,13 +502,13 @@ impl<'a> LayoutBox<'a> {
         }
 
         if let Some(mw) = style.and_then(|s| s.value("max-width")) {
-            let max_w = parse_len(mw, parent_width);
+            let max_w = parse_len_value(mw, parent_width);
             if max_w > 0.0 {
                 self.dimensions.content.width = self.dimensions.content.width.min(max_w);
             }
         }
         if let Some(mw) = style.and_then(|s| s.value("min-width")) {
-            let min_w = parse_len(mw, parent_width);
+            let min_w = parse_len_value(mw, parent_width);
             if min_w > 0.0 {
                 self.dimensions.content.width = self.dimensions.content.width.max(min_w);
             }
@@ -327,25 +528,12 @@ impl<'a> LayoutBox<'a> {
         let padding_top = style.and_then(|s| s.value("padding-top")).unwrap_or(&zero);
         let padding_bottom = style.and_then(|s| s.value("padding-bottom")).unwrap_or(&zero);
 
-        let parse_len = |v: &Value| -> f32 {
-            match v {
-                Value::Length(px, Unit::Px) => *px,
-                Value::Length(pt, Unit::Pt) => *pt * 1.333,
-                Value::Length(em, Unit::Em) => *em * 16.0,
-                Value::Length(rem, Unit::Rem) => *rem * 16.0,
-                Value::Length(vh, Unit::Vh) => 600.0 * (*vh / 100.0),
-                Value::Length(pct, Unit::Percent) => 600.0 * (*pct / 100.0),
-                Value::Number(n) => *n,
-                _ => 0.0,
-            }
-        };
-
-        self.dimensions.margin.top = parse_len(margin_top);
-        self.dimensions.margin.bottom = parse_len(margin_bottom);
-        self.dimensions.border.top = parse_len(border_top);
-        self.dimensions.border.bottom = parse_len(border_bottom);
-        self.dimensions.padding.top = parse_len(padding_top);
-        self.dimensions.padding.bottom = parse_len(padding_bottom);
+        self.dimensions.margin.top = parse_len_value(margin_top, 600.0);
+        self.dimensions.margin.bottom = parse_len_value(margin_bottom, 600.0);
+        self.dimensions.border.top = parse_len_value(border_top, 600.0);
+        self.dimensions.border.bottom = parse_len_value(border_bottom, 600.0);
+        self.dimensions.padding.top = parse_len_value(padding_top, 600.0);
+        self.dimensions.padding.bottom = parse_len_value(padding_bottom, 600.0);
 
         self.dimensions.content.x = containing_block.content.x
             + self.dimensions.margin.left
@@ -374,8 +562,14 @@ impl<'a> LayoutBox<'a> {
                 let mut cb = self.dimensions;
                 cb.content.height = y_offset;
                 child.layout(cb);
-                y_offset += child.dimensions.margin_box().height;
-                self.dimensions.content.height = y_offset;
+                let is_out_of_flow = child
+                    .get_styled_node()
+                    .and_then(|s| s.value("position"))
+                    .map_or(false, |v| matches!(v, Value::Keyword(k) if k == "absolute" || k == "fixed"));
+                if !is_out_of_flow {
+                    y_offset += child.dimensions.margin_box().height;
+                    self.dimensions.content.height = y_offset;
+                }
             }
         }
     }
@@ -388,8 +582,26 @@ impl<'a> LayoutBox<'a> {
         cur_y: &mut f32,
         line_height: &mut f32,
     ) {
+        let is_out_of_flow = item
+            .get_styled_node()
+            .and_then(|s| s.value("position"))
+            .map_or(false, |v| matches!(v, Value::Keyword(k) if k == "absolute" || k == "fixed"));
+
+        if is_out_of_flow {
+            let cb = Dimensions {
+                content: Rect::new(container_content.x, container_content.y, max_width, 0.0),
+                padding: EdgeSizes::default(),
+                border: EdgeSizes::default(),
+                margin: EdgeSizes::default(),
+            };
+            item.layout(cb);
+            return;
+        }
         let font_size = item.get_styled_node().map(|s| s.font_size(None)).unwrap_or(16.0);
-        let item_line_height = font_size * 1.35;
+        let item_line_height = item
+            .get_styled_node()
+            .map(|s| s.line_height(font_size, None))
+            .unwrap_or(font_size * 1.35);
         *line_height = line_height.max(item_line_height);
 
         match &mut item.box_type {
@@ -413,16 +625,8 @@ impl<'a> LayoutBox<'a> {
                 let specified_w = styled_node.node.get_attribute("width").and_then(|w| w.parse::<f32>().ok());
                 let specified_h = styled_node.node.get_attribute("height").and_then(|h| h.parse::<f32>().ok());
 
-                let parse_len = |v: &Value| -> Option<f32> {
-                    match v {
-                        Value::Length(px, Unit::Px) => Some(*px),
-                        Value::Number(n) => Some(*n),
-                        _ => None,
-                    }
-                };
-
-                let css_w = styled_node.value("width").and_then(parse_len);
-                let css_h = styled_node.value("height").and_then(parse_len);
+                let css_w = styled_node.value("width").map(|w| parse_len_value(w, max_width));
+                let css_h = styled_node.value("height").map(|h| parse_len_value(h, 600.0));
 
                 let img_w = css_w.or(specified_w).unwrap_or(240.0).min(max_width);
                 let img_h = css_h.or(specified_h).unwrap_or(160.0);
@@ -479,8 +683,14 @@ impl<'a> LayoutBox<'a> {
 
                     item.dimensions.content.x = container_content.x + start_x;
                     item.dimensions.content.y = container_content.y + start_y;
-                    item.dimensions.content.width = (*cur_x - start_x).max(0.0);
-                    item.dimensions.content.height = (*cur_y - start_y + *line_height).max(item_line_height);
+                    let measured_w = (*cur_x - start_x).max(0.0);
+                    let measured_h = (*cur_y - start_y + *line_height).max(item_line_height);
+
+                    let specified_w = item.get_styled_node().and_then(|s| s.value("width")).map(|w| parse_len_value(w, max_width));
+                    let specified_h = item.get_styled_node().and_then(|s| s.value("height")).map(|h| parse_len_value(h, 600.0));
+
+                    item.dimensions.content.width = specified_w.unwrap_or(measured_w);
+                    item.dimensions.content.height = specified_h.unwrap_or(measured_h);
                 }
             }
             BoxType::BlockNode(_) | BoxType::AnonymousBlock => {
@@ -527,27 +737,105 @@ impl<'a> LayoutBox<'a> {
     fn calculate_block_height(&mut self) {
         if let Some(style) = self.get_styled_node() {
             if let Some(h) = style.value("height") {
-                let parse_len = |v: &Value| -> Option<f32> {
-                    match v {
-                        Value::Length(px, Unit::Px) => Some(*px),
-                        Value::Length(pt, Unit::Pt) => Some(*pt * 1.333),
-                        Value::Length(em, Unit::Em) => Some(*em * 16.0),
-                        Value::Length(rem, Unit::Rem) => Some(*rem * 16.0),
-                        Value::Number(n) => Some(*n),
-                        _ => None,
-                    }
-                };
-                if let Some(px) = parse_len(h) {
+                let px = parse_len_value(h, 600.0);
+                if px > 0.0 {
                     self.dimensions.content.height = px;
                 }
             }
             if let Some(min_h) = style.value("min-height") {
-                if let Value::Length(px, Unit::Px) = min_h {
-                    self.dimensions.content.height = self.dimensions.content.height.max(*px);
+                let px = parse_len_value(min_h, 600.0);
+                if px > 0.0 {
+                    self.dimensions.content.height = self.dimensions.content.height.max(px);
+                }
+            }
+            if let Some(max_h) = style.value("max-height") {
+                let px = parse_len_value(max_h, 600.0);
+                if px > 0.0 {
+                    self.dimensions.content.height = self.dimensions.content.height.min(px);
                 }
             }
         }
     }
+}
+
+fn compute_grid_column_widths(spec: &str, parent_w: f32, child_count: usize, gap: f32) -> Vec<f32> {
+    let mut tokens: Vec<String> = Vec::new();
+    let spec_trimmed = spec.trim();
+
+    // Check repeat(N, ...)
+    if let Some(repeat_pos) = spec_trimmed.find("repeat(") {
+        if let Some(end_pos) = spec_trimmed[repeat_pos..].find(')') {
+            let inner = &spec_trimmed[repeat_pos + 7..repeat_pos + end_pos];
+            if let Some(comma) = inner.find(',') {
+                let n_str = inner[..comma].trim();
+                let val_str = inner[comma + 1..].trim();
+                if let Ok(n) = n_str.parse::<usize>() {
+                    for _ in 0..n {
+                        tokens.push(val_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if tokens.is_empty() {
+        if !spec_trimmed.is_empty() {
+            tokens = spec_trimmed.split_whitespace().map(|s| s.to_string()).collect();
+        } else {
+            if child_count > 1 {
+                tokens = vec!["1fr".to_string(), "1fr".to_string()];
+            } else {
+                tokens = vec!["1fr".to_string()];
+            }
+        }
+    }
+
+    let num_cols = tokens.len().max(1);
+    let total_gaps = (num_cols.saturating_sub(1) as f32) * gap;
+    let available_w = (parent_w - total_gaps).max(0.0);
+
+    let mut fixed_w = 0.0;
+    let mut fr_sum = 0.0;
+    enum ColType { Fixed(f32), Fr(f32) }
+    let mut col_types = Vec::new();
+
+    for t in &tokens {
+        let t_clean = t.trim().to_ascii_lowercase();
+        if t_clean.ends_with("fr") {
+            let fr_val = t_clean.strip_suffix("fr").unwrap().trim().parse::<f32>().unwrap_or(1.0);
+            fr_sum += fr_val;
+            col_types.push(ColType::Fr(fr_val));
+        } else if t_clean.ends_with("px") {
+            let px = t_clean.strip_suffix("px").unwrap().trim().parse::<f32>().unwrap_or(100.0);
+            fixed_w += px;
+            col_types.push(ColType::Fixed(px));
+        } else if t_clean.ends_with("rem") || t_clean.ends_with("em") {
+            let n = t_clean.strip_suffix("rem").or_else(|| t_clean.strip_suffix("em")).unwrap().trim().parse::<f32>().unwrap_or(12.0);
+            let px = n * 16.0;
+            fixed_w += px;
+            col_types.push(ColType::Fixed(px));
+        } else if t_clean == "min-content" || t_clean == "max-content" || t_clean == "auto" {
+            let w = 220.0_f32.min(available_w * 0.28).max(120.0);
+            fixed_w += w;
+            col_types.push(ColType::Fixed(w));
+        } else {
+            let w = available_w / num_cols as f32;
+            fixed_w += w;
+            col_types.push(ColType::Fixed(w));
+        }
+    }
+
+    let remaining_w = (available_w - fixed_w).max(0.0);
+    col_types.into_iter().map(|ct| match ct {
+        ColType::Fixed(w) => w,
+        ColType::Fr(fr) => {
+            if fr_sum > 0.0 {
+                remaining_w * (fr / fr_sum)
+            } else {
+                available_w / num_cols as f32
+            }
+        }
+    }).collect()
 }
 
 /// Builds a tree of LayoutBoxes from the StyledNode tree.

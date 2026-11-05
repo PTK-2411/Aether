@@ -73,6 +73,24 @@ pub fn build_display_list(layout_root: &LayoutBox) -> DisplayList {
 }
 
 fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
+    if let Some(styled_node) = layout_box.get_styled_node() {
+        if let Some(Value::Keyword(v)) = styled_node.value("visibility") {
+            if v == "hidden" || v == "collapse" {
+                return;
+            }
+        }
+        if let Some(Value::Number(op)) = styled_node.value("opacity") {
+            if *op <= 0.0 {
+                return;
+            }
+        }
+    }
+
+    let mb = layout_box.dimensions.margin_box();
+    if mb.y + mb.height < -50.0 || mb.x + mb.width < -100.0 {
+        return;
+    }
+
     render_background(list, layout_box);
     render_borders(list, layout_box);
 

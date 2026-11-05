@@ -808,7 +808,7 @@ fn fetch_search_suggestions(query: &str, tx: std::sync::mpsc::Sender<(String, Ve
 
 fn draw_tab_shield_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
     let top_y = center.y - 6.0;
-    let mid_y = center.y - 1.0;
+    let mid_y = center.y - 0.8;
     let bot_y = center.y + 6.5;
     let left_x = center.x - 5.5;
     let right_x = center.x + 5.5;
@@ -822,18 +822,14 @@ fn draw_tab_shield_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
     painter.line_segment([Pos2::new(left_x, mid_y), Pos2::new(mid_x, bot_y)], stroke);
     painter.line_segment([Pos2::new(right_x, mid_y), Pos2::new(mid_x, bot_y)], stroke);
 
-    // Inner subtle shield emblem
-    let in_stroke = Stroke::new(0.9_f32, color.gamma_multiply(0.6));
-    let in_l = center.x - 2.8;
-    let in_r = center.x + 2.8;
-    let in_t = center.y - 3.2;
-    let in_m = center.y;
-    let in_b = center.y + 3.2;
-    painter.line_segment([Pos2::new(in_l, in_t), Pos2::new(in_r, in_t)], in_stroke);
-    painter.line_segment([Pos2::new(in_l, in_t), Pos2::new(in_l, in_m)], in_stroke);
-    painter.line_segment([Pos2::new(in_r, in_t), Pos2::new(in_r, in_m)], in_stroke);
-    painter.line_segment([Pos2::new(in_l, in_m), Pos2::new(mid_x, in_b)], in_stroke);
-    painter.line_segment([Pos2::new(in_r, in_m), Pos2::new(mid_x, in_b)], in_stroke);
+    // Inner faceted crest emblem (Image 2 design)
+    let in_stroke = Stroke::new(0.9_f32, color.gamma_multiply(0.75));
+    painter.line_segment([Pos2::new(mid_x, top_y + 1.8), Pos2::new(mid_x, bot_y - 2.0)], in_stroke);
+    painter.line_segment([Pos2::new(left_x + 2.0, top_y + 2.2), Pos2::new(mid_x, top_y + 4.2)], in_stroke);
+    painter.line_segment([Pos2::new(right_x - 2.0, top_y + 2.2), Pos2::new(mid_x, top_y + 4.2)], in_stroke);
+    painter.line_segment([Pos2::new(left_x + 1.8, mid_y), Pos2::new(mid_x, bot_y - 2.5)], in_stroke);
+    painter.line_segment([Pos2::new(right_x - 1.8, mid_y), Pos2::new(mid_x, bot_y - 2.5)], in_stroke);
+    painter.line_segment([Pos2::new(left_x + 2.0, top_y + 2.2), Pos2::new(right_x - 2.0, top_y + 2.2)], in_stroke);
 }
 
 fn collect_style_tags(node: &Node, out: &mut String) {

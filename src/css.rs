@@ -620,6 +620,15 @@ impl CssParser {
                                 });
                             }
                         }
+                        Value::Keyword(k) if k.starts_with("var(") => {
+                            for side in ["top", "right", "bottom", "left"] {
+                                out.push(Declaration {
+                                    name: format!("border-{}-color", side),
+                                    value: v.clone(),
+                                    important,
+                                });
+                            }
+                        }
                         Value::Keyword(k) if matches!(k.as_str(), "solid" | "dashed" | "dotted" | "none") => {
                             for side in ["top", "right", "bottom", "left"] {
                                 out.push(Declaration {
@@ -656,6 +665,13 @@ impl CssParser {
                                 important,
                             });
                         }
+                        Value::Keyword(k) if k.starts_with("var(") => {
+                            out.push(Declaration {
+                                name: format!("border-{}-color", side),
+                                value: v.clone(),
+                                important,
+                            });
+                        }
                         Value::Keyword(k) if matches!(k.as_str(), "solid" | "dashed" | "dotted" | "none") => {
                             out.push(Declaration {
                                 name: format!("border-{}-style", side),
@@ -670,16 +686,9 @@ impl CssParser {
             return;
         }
 
-        // Shorthand for background: e.g. "#fff", "transparent", or "white none repeat"
+        // Shorthand for background: e.g. "#fff", "transparent", or "#fff url(...) no-repeat"
         if name == "background" {
-            if let Some(v) = parse_value_str(raw_value) {
-                out.push(Declaration {
-                    name: "background-color".to_string(),
-                    value: v,
-                    important,
-                });
-                return;
-            }
+            let mut found_color = false;
             for token in &tokens {
                 if let Some(v) = parse_value_str(token) {
                     if matches!(&v, Value::ColorValue(..))
@@ -690,8 +699,18 @@ impl CssParser {
                             value: v,
                             important,
                         });
+                        found_color = true;
                         break;
                     }
+                }
+            }
+            if !found_color && tokens.len() == 1 {
+                if let Some(v) = parse_value_str(raw_value) {
+                    out.push(Declaration {
+                        name: "background-color".to_string(),
+                        value: v,
+                        important,
+                    });
                 }
             }
             return;
@@ -905,6 +924,33 @@ pub fn parse_color(s: &str) -> Option<CssColor> {
         } else {
             None
         }
+    } else if (s.starts_with("hsl(") || s.starts_with("hsla(")) && s.ends_with(')') {
+        let prefix_len = if s.starts_with("hsla(") { 5 } else { 4 };
+        let inner = &s[prefix_len..s.len() - 1];
+        let parts: Vec<&str> = if inner.contains(',') {
+            inner.split(',').map(|p| p.trim()).collect()
+        } else {
+            inner.split_whitespace().collect()
+        };
+        if parts.len() >= 3 {
+            let h = parts[0].trim_end_matches("deg").parse::<f32>().ok()?;
+            let s_val = parts[1].trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+            let l_val = parts[2].trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+            let a = if parts.len() >= 4 {
+                let a_str = parts[3].trim_start_matches('/').trim();
+                if a_str.ends_with('%') {
+                    (a_str.trim_end_matches('%').parse::<f32>().ok()? / 100.0 * 255.0).clamp(0.0, 255.0) as u8
+                } else {
+                    (a_str.parse::<f32>().ok()? * 255.0).clamp(0.0, 255.0) as u8
+                }
+            } else {
+                255
+            };
+            let (r, g, b) = hsl_to_rgb(h, s_val, l_val);
+            Some(CssColor::new(r, g, b, a))
+        } else {
+            None
+        }
     } else {
         match s.to_ascii_lowercase().as_str() {
             "transparent" => Some(CssColor::TRANSPARENT),
@@ -927,4 +973,32 @@ pub fn parse_color(s: &str) -> Option<CssColor> {
             _ => None,
         }
     }
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let h = ((h % 360.0) + 360.0) % 360.0;
+    let s = s.clamp(0.0, 1.0);
+    let l = l.clamp(0.0, 1.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = h / 60.0;
+    let x = c * (1.0 - ((h_prime % 2.0) - 1.0).abs());
+    let (r1, g1, b1) = if h_prime < 1.0 {
+        (c, x, 0.0)
+    } else if h_prime < 2.0 {
+        (x, c, 0.0)
+    } else if h_prime < 3.0 {
+        (0.0, c, x)
+    } else if h_prime < 4.0 {
+        (0.0, x, c)
+    } else if h_prime < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let m = l - c / 2.0;
+    (
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }

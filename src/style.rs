@@ -52,7 +52,7 @@ impl<'a> StyledNode<'a> {
             return Display::None;
         }
 
-        match self.value("display") {
+        let specified_display = match self.value("display") {
             Some(Value::Keyword(s)) => match s.as_str() {
                 "block" => Display::Block,
                 "none" => Display::None,
@@ -65,12 +65,30 @@ impl<'a> StyledNode<'a> {
             _ => {
                 if let Some(tag) = self.node.tag_name() {
                     if is_default_block_element(tag) {
-                        return Display::Block;
+                        Display::Block
+                    } else {
+                        Display::Inline
                     }
+                } else {
+                    Display::Inline
                 }
-                Display::Inline
+            }
+        };
+
+        if specified_display == Display::None {
+            return Display::None;
+        }
+
+        // CSS 2.1 Section 9.7: position: absolute or fixed computes inline to block
+        if let Some(Value::Keyword(pos)) = self.value("position") {
+            if pos == "absolute" || pos == "fixed" {
+                if specified_display == Display::Inline || specified_display == Display::InlineBlock {
+                    return Display::Block;
+                }
             }
         }
+
+        specified_display
     }
 
     /// Looks up a property; if not found, checks if it is an inheritable property
@@ -114,7 +132,36 @@ impl<'a> StyledNode<'a> {
                 em * parent_size
             }
             Value::Length(rem, Unit::Rem) => rem * 16.0,
+            Value::Length(pct, Unit::Percent) => {
+                let parent_size = parent.map(|p| p.font_size(None)).unwrap_or(16.0);
+                parent_size * (pct / 100.0)
+            }
+            Value::Keyword(k) => match k.as_str() {
+                "xx-small" => 9.0,
+                "x-small" => 10.0,
+                "small" => 13.0,
+                "medium" => 16.0,
+                "large" => 18.0,
+                "x-large" => 24.0,
+                "xx-large" => 32.0,
+                "smaller" => parent.map(|p| p.font_size(None)).unwrap_or(16.0) * 0.85,
+                "larger" => parent.map(|p| p.font_size(None)).unwrap_or(16.0) * 1.2,
+                _ => 16.0,
+            },
             _ => 16.0,
+        }
+    }
+
+    pub fn line_height(&self, font_size: f32, parent: Option<&StyledNode>) -> f32 {
+        let fallback = Value::Number(1.35);
+        match self.lookup("line-height", &fallback, parent) {
+            Value::Number(n) => (font_size * n).max(8.0),
+            Value::Length(px, Unit::Px) => px.max(8.0),
+            Value::Length(em, Unit::Em) => (font_size * em).max(8.0),
+            Value::Length(rem, Unit::Rem) => (16.0 * rem).max(8.0),
+            Value::Length(pct, Unit::Percent) => (font_size * (pct / 100.0)).max(8.0),
+            Value::Keyword(k) if k == "normal" => font_size * 1.35,
+            _ => font_size * 1.35,
         }
     }
 
@@ -502,6 +549,8 @@ fn matches_selector(node: &Node, ancestors: &[&Node], selector: &Selector) -> bo
                             return false;
                         }
                     }
+                    _ => return false,
+                }
             }
             SelectorPart::Simple(_) => return false,
         }
