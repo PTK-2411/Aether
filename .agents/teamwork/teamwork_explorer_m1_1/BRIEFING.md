@@ -1,4 +1,4 @@
-# BRIEFING — 2026-11-05T06:12:00Z
+# BRIEFING — 2026-11-05T06:16:30Z
 
 ## Mission
 Investigate and design the exact fix strategy for `src/network.rs` (Google search query routing & robust domain detection) and `tests/browser_tests.rs` for Milestone M1.
@@ -21,15 +21,22 @@ Investigate and design the exact fix strategy for `src/network.rs` (Google searc
 - Updated: not yet
 
 ## Investigation State
-- **Explored paths**: ORIGINAL_REQUEST.md, PROJECT.md, teamwork_explorer_survey_1/handoff.md
-- **Key findings**: `normalize_url` in `src/network.rs` is the authoritative function; currently routes to `https://search.aether.local/?q=...`; domain detection needs to handle schemes, localhost, IPv4, standard multi-label domains without spaces.
-- **Unexplored areas**: Source inspection of `src/network.rs` and `tests/browser_tests.rs`, verification of current `cargo check` and `cargo test`.
+- **Explored paths**: `ORIGINAL_REQUEST.md`, `PROJECT.md`, `src/network.rs`, `tests/browser_tests.rs`, `src/app.rs`.
+- **Key findings**:
+  1. `cargo check` and `cargo test` pass (11 tests passed).
+  2. `normalize_url` in `src/network.rs` currently formats queries to `https://search.aether.local/?q={}`.
+  3. Domain check currently uses `trimmed.contains('.') && !trimmed.contains(' ')`, causing version strings (`1.0`, `v1.2`) and punctuation (`hello...`) to be misclassified as domains, and missing `localhost` and `localhost:<port>`.
+  4. Designed pure-Rust `is_valid_domain_or_ip` recognizing IPv4, port numbers, standard multi-label domains (alphabetic TLD length >= 2, no leading/trailing hyphens), and dedicated `localhost` routing to `http://`.
+  5. Search queries route to `https://www.google.com/search?q={}` using `url::form_urlencoded::byte_serialize` (or zero-dep percent encoder).
+  6. Verified logic comprehensively with test cases covering domains, IPs, versions, punctuation, localhost, schemes, and search queries.
+- **Unexplored areas**: None within the M1 network and test scope.
 
 ## Key Decisions Made
-- Focus on robust domain parsing, proper percent-encoding for Google search queries, and comprehensive test coverage.
+- Use pure-Rust standard library domain parsing (Ipv4Addr, RFC 1035/1123 label rules) to avoid external crates.
+- Provide exact before/after diffs for `src/network.rs` and `tests/browser_tests.rs` in `handoff.md`.
 
 ## Artifact Index
-- /home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_explorer_m1_1/DISPATCH.md — Dispatch log
-- /home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_explorer_m1_1/BRIEFING.md — Situational awareness
-- /home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_explorer_m1_1/progress.md — Progress and heartbeat
-- /home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_explorer_m1_1/handoff.md — 5-component report
+- `/home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_explorer_m1_1/DISPATCH.md` — Incoming task dispatch record
+- `/home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_explorer_m1_1/BRIEFING.md` — Persistent situational awareness
+- `/home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_explorer_m1_1/progress.md` — Liveness heartbeat and step tracking
+- `/home/ptk/Documents/Projects/Rust-browser/.agents/teamwork/teamwork_explorer_m1_1/handoff.md` — Final investigation report
