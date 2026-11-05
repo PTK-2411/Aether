@@ -806,7 +806,7 @@ impl BrowserApp {
         });
     }
 
-    /// Renders the Chrome Navigation Toolbar (Back, Forward, Reload, Omnibox, AI Mode, Profile)
+    /// Renders the Chrome Navigation Toolbar (Back, Forward, Reload, Omnibox, Login, Menu)
     fn render_navigation_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -907,10 +907,10 @@ impl BrowserApp {
                 self.navigate_active_tab(&target);
             }
 
-            // Right side of Toolbar: User profile avatar ("Hi, Khoa") and Menu ⋮
+            // Right side of Toolbar: Login button and Menu ⋮
             ui.add_space(4.0);
 
-            // Login button/pill routing to Google Accounts (replaces profile pill "Hi, Khoa")
+            // Login button/pill routing to Google Accounts
             let (p_rect, p_resp) = ui.allocate_exact_size(Vec2::new(64.0, 28.0), egui::Sense::click());
             if p_resp.hovered() {
                 ui.painter().rect_filled(p_rect, 14.0, Color32::from_rgb(52, 54, 58));
