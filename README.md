@@ -1,133 +1,169 @@
-# 🦀 IronSurf — Trình Duyệt Web Thuần Rust (100% Pure Rust, Zero Chromium)
+# 🦀 Aether — 100% Pure Rust Web Browser (Zero Chromium)
 
-**IronSurf** là một trình duyệt web độc lập được xây dựng hoàn toàn từ con số 0 bằng ngôn ngữ lập trình **Rust**, không sử dụng bất kỳ thành phần nào của Chromium, Blink, WebKit, Gecko hay CEF/Electron.
+**Aether** is an independent, lightweight web browser built entirely from scratch in **Rust**, with zero dependencies on Chromium, Blink, WebKit, Gecko, CEF, or Electron.
 
-Dự án triển khai trọn vẹn toàn bộ chu trình xử lý (browser pipeline) theo đặc tả web chuẩn: từ kết nối mạng HTTP(S) bảo mật qua Rustls, bộ phân tích cú pháp HTML Tokenizer & cây DOM, bộ phân giải CSS & độ ưu tiên Specificity, mô hình hộp CSS Box Model & ngắt dòng Layout Flow, đến bộ sinh danh sách lệnh vẽ Display List và giao diện người dùng đa thẻ tích hợp công cụ DevTools Inspector.
+The project implements the complete standard web browser pipeline: from secure HTTP(S) networking over Rustls, an HTML Tokenizer and DOM tree builder, a CSS parser with W3C specificity cascading and inheritance, a CSS Box Model and inline text flow layout engine, multithreaded image rendering (`<img>`), an optimized Display List painter, real-time search autocomplete suggestions, to a custom borderless dark theme UI and interactive DevTools Inspector (F12).
 
 ---
 
-## 🏗 Kiến Trúc Động Cơ (Browser Engine Pipeline)
+## 🏗 Browser Engine Pipeline
 
 ```
 [ URL / Input ] 
        │
        ▼
-1. Network Stack (network.rs) ──► Tải mã nguồn HTML qua HTTP/HTTPS (Rustls) hoặc giao thức nội bộ (about:, file://)
+1. Network Stack (network.rs) ──► Loads HTML over HTTP/HTTPS (Rustls) or internal protocols (about:, file://)
        │
        ▼
-2. HTML Parser & DOM (html_parser.rs, dom.rs) ──► Tokenizer phân tích thẻ, thuộc tính, thực thể & dựng cây DOM Node
+2. HTML Parser & DOM (html_parser.rs, dom.rs) ──► Tokenizes tags, attributes, void elements & builds DOM tree
        │
        ▼
-3. CSS Parser & Cascade (css.rs, style.rs, default_style.rs) ──► Nạp UA Stylesheet, phân tích Selector, tính Specificity & kế thừa
+3. CSS Parser & Cascade (css.rs, style.rs, default_style.rs) ──► Loads UA styles, matches selectors & computes specificity
        │
        ▼
-4. Box Model Layout (layout.rs) ──► Tính toán Content, Padding, Border, Margin, căn lề auto và ngắt dòng Inline Flow
+4. Box Model Layout (layout.rs) ──► Resolves Content, Padding, Border, Margin, auto-centering, Word-Wrapping & image sizing
        │
        ▼
-5. Display List & Painter (render.rs) ──► Chuyển cây bố cục thành lệnh vẽ đồ họa và vùng tương tác (hyperlinks)
+5. Display List & Painter (render.rs) ──► Translates layout into GPU draw commands, renders images & performs link hit-testing
        │
        ▼
-6. Browser Chrome & DevTools (app.rs, main.rs) ──► Cửa sổ đa thẻ, thanh địa chỉ thông minh, nút điều hướng & DOM Inspector F12
+6. Browser Chrome & DevTools (app.rs, main.rs) ──► Custom borderless window, Search Suggestions, Omnibox & F12 DevTools
 ```
 
 ---
 
-## 🌟 Các Tính Năng Nổi Bật
+## 🌟 Key Features
 
-### 1. Chu trình kết xuất chuẩn (Complete Rendering Engine)
-- **HTML Tokenizer & DOM Builder**: Tự sinh cây đối tượng DOM, xử lý các thẻ tự đóng (void elements như `img`, `meta`, `link`, `br`, `hr`), trích xuất nội dung thẻ thô (`<style>`, `<script>`) và giải mã thực thể HTML (`&amp;`, `&lt;`, `&gt;`, `&copy;`, ...).
-- **CSS Engine**:
-  - Hỗ trợ các bộ chọn: Universal `*`, Type/Tag (`h1`, `p`, `div`), Class (`.card`), ID (`#main`), Combinators (`div > p`, `nav a`).
-  - Tính toán độ ưu tiên Specificity chính xác theo chuẩn W3C: `(ID, Class, Tag)`.
-  - Mở rộng cú pháp viết tắt (shorthands): `margin`, `padding`, `border`, `background`.
-  - Cơ chế thừa kế kiểu (Style Inheritance) cho kiểu chữ, màu sắc, font-size từ phần tử cha xuống phần tử con.
-- **CSS Box Model & Layout Engine**:
-  - Tính toán chính xác 4 lớp hộp: Content Box, Padding Box, Border Box, Margin Box.
-  - Hỗ trợ căn giữa khối bằng `margin: 0 auto`.
-  - Cơ chế Flow Layout thông minh tự động ngắt dòng văn bản (Word Wrapping) và bố trí các phần tử nội dòng (inline links, buttons, inputs).
+### 1. Complete Rendering Engine Pipeline
+- **HTML Tokenizer & DOM Builder**:
+  - Automatically parses standard HTML markup into a complete DOM object tree.
+  - Handles void self-closing elements (`img`, `meta`, `link`, `br`, `hr`, `input`).
+  - Correctly extracts raw text contents inside `<style>` and `<script>` blocks.
+  - Decodes HTML entities (`&amp;`, `&lt;`, `&gt;`, `&copy;`, `&quot;`, `&#39;`).
+  - Automatically hides metadata elements (`<head>`, `<title>`, `<style>`, `<script>`, `<meta>`, `<link>`, `<noscript>`, `<template>`).
+  - Filters out invisible zero-width and bidirectional formatting characters (`\u{200E}`, `\u{200F}`, `\u{200B}`, `\u{FEFF}`) to prevent missing glyph box glyphs.
+- **CSS Cascade & Style Engine**:
+  - Selector matching: Universal `*`, Type/Tag (`h1`, `p`, `div`), Class (`.card`), ID (`#main`), Combinators (`div > p`, `nav a`).
+  - Precise W3C specificity calculations: `(ID, Class, Tag)`.
+  - Shorthand property expansion: `margin`, `padding`, `border`, `background`.
+  - Style inheritance down the DOM hierarchy for typography, font size, and colors.
+- **CSS Box Model & Flow Layout**:
+  - Accurately computes all four box model layers: Content, Padding, Border, and Margin.
+  - Implements automatic block centering with `margin: 0 auto`.
+  - Intelligent inline flow layout with natural word-wrapping and calibrated character metrics.
+- **Image Rendering (`<img>`)**:
+  - Automatically parses `<img>` tags and respects explicit attributes (`width`, `height`) and CSS dimensions.
+  - Background multithreaded fetching and decoding for PNG, JPEG, WebP, and Base64 Data URIs without freezing the UI.
+  - Elegant vector placeholder fallback with `alt` text preview during network loading or offline states.
 - **Display List & Hit Testing**:
-  - Tạo danh sách lệnh vẽ đồ họa được tối ưu hóa trước khi đưa vào GPU/Painter.
-  - Nhận diện con trỏ chuột hover lên các siêu liên kết (`<a>`), đổi con trỏ sang hình bàn tay (`PointingHand`) và kích hoạt điều hướng khi click.
+  - Generates optimized draw commands before dispatching to the painter.
+  - Detects mouse hover over hyperlinks (`<a>`), switches the cursor to `PointingHand`, and navigates upon click.
 
-### 2. Giao diện Trình Duyệt Đa Thẻ Hiện Đại (Browser Chrome)
-- **Hệ thống Tab đa nhiệm**: Mở tab mới (`+`), chuyển đổi giữa các tab, đóng từng tab (`×`). Mỗi tab độc lập về DOM, lịch sử điều hướng và trạng thái tải.
-- **Thanh điều hướng**: Nút Back `⬅`, Forward `➡`, Refresh `🔄`, Home `🏠`.
-- **Thanh địa chỉ thông minh (Omnibox)**:
-  - Tự động nhận diện URL và tự động bổ sung giao thức an toàn `https://`.
-  - Tự động chuyển cụm từ tìm kiếm sang công cụ tìm kiếm nếu không phải là URL.
-  - Hiển thị huy hiệu bảo mật: `🔒 HTTPS`, `📄 Internal`, `🔓 HTTP`.
-- **Thu phóng trang (Zoom Controls)**: Hỗ trợ phóng to / thu nhỏ từ 50% đến 200%.
-- **Thanh trạng thái (Status Bar)**: Hiển thị URL của liên kết đang được rê chuột tới.
+### 2. Aether Custom UI & Real-Time Search Suggestions
+- **Custom Borderless Window (No OS Title Bar)**:
+  - Native OS title bar disabled (`with_decorations(false)`) for a clean, unified browser window.
+  - Built-in vector window controls: **Minimize**, **Maximize / Restore**, and **Close** with smooth hover highlights.
+  - Seamless window dragging on empty tab bar space and double-click to maximize/restore.
+- **Aether Dark Theme & Modern Start Page**:
+  - Sleek dark aesthetic with capsule Omnibox, vector icons, and customizable quick shortcuts (Wikipedia, YouTube, GitHub, Rust Lang, Aether AI, Reddit, DuckDuckGo).
+  - 100% Vector Icons: All controls (navigation chevrons, close tab 'x', magnifying glass, mic, camera, menus) are drawn geometrically with vector paths, eliminating missing symbol glyphs.
+- **Real-Time Search Suggestions**:
+  - Typing in the Omnibox or the New Tab search box displays a floating suggestion dropdown.
+  - Connected directly to search autocomplete APIs with an offline fallback dictionary.
+  - Click any suggestion to instantly search.
 
-### 3. Bộ Công Cụ Lập Trình Tích Hợp (DevTools Inspector F12)
-- **DOM Tree Inspector**: Xem cấu trúc phân cấp cây DOM, mở rộng/thu gọn từng nút phần tử và xem chi tiết thuộc tính.
-- **Styles Inspector**: Xem danh sách các bộ quy tắc CSS đang áp dụng lên trang.
-- **HTML Source**: Xem mã nguồn HTML gốc với phông chữ monospace.
-- **Network & Diagnostics**: Đo lường dung lượng tải, thời gian phản hồi và thông tin bảo mật kết nối.
+### 3. Built-in Developer Tools (F12 Inspector)
+- **Clearly Divided Panels**:
+  - **DOM Hierarchy Tree Card**: Expandable and selectable DOM node tree with syntax-colored tags, IDs, classes, and text previews.
+  - **Selected Element Inspector Card**:
+    - **Chrome-style Box Model Visualizer**: Displays concentric layers for Margin (orange), Border (yellow), Padding (green), and Content (blue) with real-time dimensional values.
+    - **HTML Attributes Table**: Key-value inspector for element attributes (`id`, `class`, `src`, `href`).
+    - **Computed Styles Table**: Inspects computed properties (`display`, `color`, `font-size`, `background`).
+- **CSS Rules Cascade Inspector**: Lists parsed stylesheet rules, selector specificity scores, and declaration blocks.
+- **HTML Source Viewer**: Raw document viewer with byte metrics.
+- **Diagnostics & Network**: Displays connection protocols, Rustls TLS state, document byte size, render height, and engine status.
 
-### 4. Các Trang Nội Bộ Có Sẵn (Built-in Pages)
-- `about:welcome`: Bảng chào mừng hiện đại với thông số kỹ thuật và các liên kết nhanh.
-- `about:test` hoặc `about:acid`: Trang kiểm thử giao diện toàn diện (thẻ card, nút bấm, trích dẫn, mã nguồn, khối màu).
-- `about:credits`: Tài liệu chi tiết về kiến trúc động cơ trình duyệt.
-- Hỗ trợ tải các trang web thực tế qua Internet (ví dụ: `https://example.com`, `https://news.ycombinator.com`).
+### 4. Built-in Internal Pages
+- `about:newtab`: Beautiful Aether Dark Mode start page with smart search and quick shortcuts.
+- `about:ai`: Dedicated **Aether AI Mode** assistant with preloaded research prompts and architecture insights.
+- `about:welcome`: Modern welcome dashboard detailing technical specifications and navigation guides.
+- `about:test` / `about:acid`: Comprehensive CSS and DOM test suite (cards, buttons, blockquotes, syntax blocks).
+- `about:credits`: In-depth documentation of the browser engine architecture and standard web pipeline.
+- Built-in **Aether Search**: Automatically queries and synthesizes verified encyclopedia knowledge from Wikipedia.
 
 ---
 
-## 🚀 Hướng Dẫn Cài Đặt & Khởi Chạy
+## 🚀 Getting Started
 
-### Yêu cầu môi trường
-- Hệ điều hành: Linux, macOS, hoặc Windows.
-- Đã cài đặt [Rust](https://rustup.rs/) (phiên bản 1.80+ trở lên).
+### Prerequisites
+- Operating System: Linux (X11 / Wayland), macOS, or Windows.
+- [Rust toolchain](https://rustup.rs/) (version 1.80+ or later).
 
-### 1. Kiểm tra mã nguồn và chạy Unit Tests
+### Build & Run
+
+Run Aether in release mode:
+```bash
+cargo run --release
+```
+
+Or run in debug mode:
+```bash
+cargo run
+```
+
+The **Aether** browser window will launch with the dark theme New Tab page and custom window controls!
+
+### Running Unit Tests
+
+Run the comprehensive test suite:
 ```bash
 cargo test
 ```
-Tất cả 8 bài kiểm thử chuyên sâu về HTML, CSS, Specificity, Box Model và URL resolution sẽ được thực thi:
+
+All 11 unit and integration tests validate the HTML parser, void elements, CSS specificity, shorthands, style cascading, box model calculations, and image layout:
 ```
-running 8 tests
+running 11 tests
+test test_html_entities_and_void_tags ... ok
 test test_css_shorthands_and_colors ... ok
 test test_html_parser_basic ... ok
 test test_css_parser_rules_and_specificity ... ok
 test test_html_style_raw_content ... ok
-test test_html_entities_and_void_tags ... ok
 test test_layout_box_model_calculation ... ok
-test test_url_normalization_and_resolution ... ok
 test test_style_cascading_and_inheritance ... ok
-```
+test test_url_normalization_and_resolution ... ok
+test test_image_layout_and_display_item ... ok
+test test_metadata_elements_hidden ... ok
+test test_text_word_spacing ... ok
 
-### 2. Khởi chạy trình duyệt
-```bash
-cargo run
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
-Cửa sổ trình duyệt **IronSurf** sẽ xuất hiện với trang chào mừng `about:welcome`.
 
 ---
 
-## 📂 Cấu Trúc Thư Mục Dự Án
+## 📂 Project Structure
 
 ```
 Rust-browser/
-├── Cargo.toml               # Cấu hình phụ thuộc (eframe, reqwest rustls, url, image)
-├── README.md                # Tài liệu hướng dẫn sử dụng và giới thiệu kiến trúc
+├── Cargo.toml               # Project manifest (eframe, reqwest with rustls-tls, url, image)
+├── README.md                # Project documentation and architectural guide
 ├── src/
-│   ├── lib.rs               # Module exports cho thư viện và integration test
-│   ├── main.rs              # Điểm khởi chạy ứng dụng GUI (eframe native entrypoint)
-│   ├── app.rs               # Giao diện Chrome: Quản lý Tab, Toolbar, Omnibox, DevTools
-│   ├── dom.rs               # Cấu trúc dữ liệu DOM: Node, NodeType, ElementData, Attribute map
-│   ├── html_parser.rs       # Bộ phân tích cú pháp HTML và xây dựng cây DOM thuần Rust
-│   ├── css.rs               # Bộ phân tích cú pháp CSS, bộ chọn Selectors, màu sắc & Shorthands
-│   ├── default_style.rs     # User-Agent Stylesheet mặc định cho các thẻ HTML
-│   ├── style.rs             # Tính toán độ ưu tiên Specificity, Cascading & kế thừa thuộc tính
-│   ├── layout.rs            # Mô hình hộp CSS Box Model & giải thuật dàn trang Flow Layout
-│   ├── render.rs            # Bộ sinh danh sách lệnh vẽ Display List & bắt sự kiện tương tác
-│   └── network.rs           # Bộ nạp tài nguyên mạng bất đồng bộ (HTTP/HTTPS Rustls, about:, file://)
+│   ├── lib.rs               # Library root and module exports
+│   ├── main.rs              # Application entrypoint (eframe borderless window configuration)
+│   ├── app.rs               # Browser UI: Tabs, Omnibox, Search Suggestions, DevTools, Aether New Tab
+│   ├── dom.rs               # DOM tree structures: Node, NodeType, ElementData, Attribute map
+│   ├── html_parser.rs       # Pure-Rust HTML tokenizer and DOM tree constructor
+│   ├── css.rs               # CSS parser: Selectors, specificity, colors, and shorthand properties
+│   ├── default_style.rs     # User-Agent default stylesheet for standard HTML elements
+│   ├── style.rs             # Style tree generator: Cascading, specificity calculation & inheritance
+│   ├── layout.rs            # CSS Box Model layout engine & flow inline word-wrapping
+│   ├── render.rs            # Display list generator, image rendering, and link hit-testing
+│   └── network.rs           # Network fetcher (Rustls HTTP/HTTPS, Aether Search, about:, file://)
 └── tests/
-    └── browser_tests.rs     # Bộ kiểm thử tự động toàn diện cho các thành phần
+    └── browser_tests.rs     # Automated test suite covering the entire rendering engine
 ```
 
 ---
 
-## 🛡️ Giấy Phép & Tuyên Bố Bản Quyền
-Dự án được xây dựng phục vụ nghiên cứu và phát triển phần mềm hệ thống với ngôn ngữ Rust. 
-Hoàn toàn độc lập, không sử dụng mã nguồn Chromium/WebKit/Blink.
+## 🛡️ License & Principles
+
+Aether is an open-source systems programming project built to demonstrate that a standards-compliant, lightweight, and memory-safe web browser can be engineered purely in Rust without relying on monolithic engines such as Chromium, Blink, or WebKit.

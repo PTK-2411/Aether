@@ -39,6 +39,11 @@ pub enum DisplayItem {
         text: String,
         placeholder: String,
     },
+    Image {
+        rect: Rect,
+        src: String,
+        alt: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +147,13 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
                 });
             }
         }
+        BoxType::ImageNode { src, alt, .. } => {
+            list.items.push(DisplayItem::Image {
+                rect: layout_box.dimensions.content,
+                src: src.clone(),
+                alt: alt.clone(),
+            });
+        }
         _ => {}
     }
 
@@ -205,12 +217,13 @@ pub fn css_to_egui_color(c: CssColor) -> Color32 {
     Color32::from_rgba_premultiplied(c.r, c.g, c.b, c.a)
 }
 
-/// Paints the entire display list onto egui::Painter with offset and zoom.
+/// Paints the entire display list onto egui::Painter with offset, zoom, and optional image textures.
 pub fn paint_display_list(
     painter: &egui::Painter,
     list: &DisplayList,
     offset: Vec2,
     zoom: f32,
+    textures: Option<&std::collections::HashMap<String, egui::TextureHandle>>,
 ) {
     for item in &list.items {
         match item {
@@ -254,6 +267,59 @@ pub fn paint_display_list(
                     painter.line_segment([p1, p2], Stroke::new(1.0 * zoom, *color));
                 }
             }
+            DisplayItem::Image { rect, src, alt } => {
+                let screen_rect = egui::Rect::from_min_size(
+                    Pos2::new(rect.x * zoom + offset.x, rect.y * zoom + offset.y),
+                    Vec2::new(rect.width * zoom, rect.height * zoom),
+                );
+
+                let mut drawn = false;
+                if let Some(tex_map) = textures {
+                    if let Some(texture) = tex_map.get(src) {
+                        painter.image(
+                            texture.id(),
+                            screen_rect,
+                            egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        drawn = true;
+                    }
+                }
+
+                if !drawn {
+                    painter.rect_filled(screen_rect, 6.0 * zoom, Color32::from_rgb(240, 242, 245));
+                    painter.rect_stroke(
+                        screen_rect,
+                        6.0 * zoom,
+                        Stroke::new(1.0 * zoom, Color32::from_rgb(215, 218, 224)),
+                        StrokeKind::Inside,
+                    );
+
+                    let center = screen_rect.center();
+                    let icon_r = (screen_rect.height() * 0.18).clamp(8.0, 22.0) * zoom;
+                    let icon_center = if alt.is_empty() {
+                        center
+                    } else {
+                        Pos2::new(center.x, center.y - 8.0 * zoom)
+                    };
+                    draw_image_placeholder_icon(painter, icon_center, icon_r, Color32::from_rgb(140, 146, 156));
+
+                    if !alt.is_empty() && screen_rect.height() > 36.0 {
+                        let preview_alt = if alt.len() > 30 {
+                            format!("{}...", &alt[..28])
+                        } else {
+                            alt.clone()
+                        };
+                        painter.text(
+                            Pos2::new(center.x, center.y + 10.0 * zoom),
+                            egui::Align2::CENTER_CENTER,
+                            preview_alt,
+                            FontId::proportional(11.0 * zoom),
+                            Color32::from_rgb(115, 120, 130),
+                        );
+                    }
+                }
+            }
             DisplayItem::ButtonBox { rect, label, bg_color, text_color } => {
                 let screen_rect = egui::Rect::from_min_size(
                     Pos2::new(rect.x * zoom + offset.x, rect.y * zoom + offset.y),
@@ -292,4 +358,15 @@ pub fn paint_display_list(
             }
         }
     }
+}
+
+fn draw_image_placeholder_icon(painter: &egui::Painter, center: Pos2, r: f32, color: Color32) {
+    let frame = egui::Rect::from_center_size(center, Vec2::new(r * 2.2, r * 1.6));
+    painter.rect_stroke(frame, 2.0_f32, Stroke::new(1.2_f32, color), StrokeKind::Inside);
+    let sun_pos = Pos2::new(frame.right() - r * 0.55, frame.top() + r * 0.45);
+    painter.circle_filled(sun_pos, r * 0.2, color);
+    let m1 = Pos2::new(frame.left() + r * 0.25, frame.bottom() - 1.0);
+    let m2 = Pos2::new(frame.left() + r * 0.95, frame.top() + r * 0.7);
+    let m3 = Pos2::new(frame.left() + r * 1.65, frame.bottom() - 1.0);
+    painter.add(egui::Shape::convex_polygon(vec![m1, m2, m3], color, Stroke::NONE));
 }

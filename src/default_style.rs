@@ -1,4 +1,8 @@
 pub const DEFAULT_USER_AGENT_CSS: &str = r#"
+head, meta, link, script, style, title, noscript, template {
+    display: none;
+}
+
 html, body {
     display: block;
     margin: 8px;

@@ -63,6 +63,11 @@ impl Dimensions {
 pub enum BoxType<'a> {
     BlockNode(&'a StyledNode<'a>),
     InlineNode(&'a StyledNode<'a>),
+    ImageNode {
+        src: String,
+        alt: String,
+        styled_node: &'a StyledNode<'a>,
+    },
     TextFragment {
         text: String,
         styled_node: &'a StyledNode<'a>,
@@ -89,7 +94,7 @@ impl<'a> LayoutBox<'a> {
 
     pub fn get_styled_node(&self) -> Option<&'a StyledNode<'a>> {
         match &self.box_type {
-            BoxType::BlockNode(node) | BoxType::InlineNode(node) => Some(*node),
+            BoxType::BlockNode(node) | BoxType::InlineNode(node) | BoxType::ImageNode { styled_node: node, .. } => Some(*node),
             BoxType::TextFragment { styled_node, .. } => Some(*styled_node),
             BoxType::AnonymousBlock => None,
         }
@@ -101,7 +106,7 @@ impl<'a> LayoutBox<'a> {
             BoxType::BlockNode(_) | BoxType::AnonymousBlock => {
                 self.layout_block(containing_block);
             }
-            BoxType::InlineNode(_) | BoxType::TextFragment { .. } => {
+            BoxType::InlineNode(_) | BoxType::ImageNode { .. } | BoxType::TextFragment { .. } => {
                 // Handled during inline flow of parent block
             }
         }
@@ -252,7 +257,7 @@ impl<'a> LayoutBox<'a> {
 
     fn layout_block_children(&mut self) {
         let has_inline_children = self.children.iter().any(|c| match c.box_type {
-            BoxType::InlineNode(_) | BoxType::TextFragment { .. } => true,
+            BoxType::InlineNode(_) | BoxType::TextFragment { .. } | BoxType::ImageNode { .. } => true,
             _ => false,
         });
 
@@ -286,6 +291,8 @@ impl<'a> LayoutBox<'a> {
             match &mut child.box_type {
                 BoxType::TextFragment { text, .. } => {
                     let text_w = estimate_text_width(text, font_size);
+                    let space_gap = (font_size * 0.38).max(5.0);
+
                     if cur_x + text_w > max_width && cur_x > 0.0 {
                         // Wrap to new line
                         cur_x = 0.0;
@@ -295,7 +302,37 @@ impl<'a> LayoutBox<'a> {
                     child.dimensions.content.y = self.dimensions.content.y + cur_y;
                     child.dimensions.content.width = text_w;
                     child.dimensions.content.height = item_line_height;
-                    cur_x += text_w;
+                    cur_x += text_w + space_gap;
+                }
+                BoxType::ImageNode { styled_node, .. } => {
+                    let specified_w = styled_node.node.get_attribute("width").and_then(|w| w.parse::<f32>().ok());
+                    let specified_h = styled_node.node.get_attribute("height").and_then(|h| h.parse::<f32>().ok());
+
+                    let parse_len = |v: &Value| -> Option<f32> {
+                        match v {
+                            Value::Length(px, Unit::Px) => Some(*px),
+                            Value::Number(n) => Some(*n),
+                            _ => None,
+                        }
+                    };
+
+                    let css_w = styled_node.value("width").and_then(parse_len);
+                    let css_h = styled_node.value("height").and_then(parse_len);
+
+                    let img_w = css_w.or(specified_w).unwrap_or(240.0).min(max_width);
+                    let img_h = css_h.or(specified_h).unwrap_or(160.0);
+
+                    if cur_x + img_w > max_width && cur_x > 0.0 {
+                        cur_x = 0.0;
+                        cur_y += line_height;
+                    }
+
+                    child.dimensions.content.x = self.dimensions.content.x + cur_x;
+                    child.dimensions.content.y = self.dimensions.content.y + cur_y;
+                    child.dimensions.content.width = img_w;
+                    child.dimensions.content.height = img_h;
+                    line_height = line_height.max(img_h);
+                    cur_x += img_w + 10.0;
                 }
                 BoxType::InlineNode(node) => {
                     // Check button or input or inline box
@@ -360,9 +397,9 @@ pub fn build_layout_tree<'a>(root: &'a StyledNode<'a>) -> Option<LayoutBox<'a>> 
 
         match &child.node.node_type {
             NodeType::Text(text) => {
-                let cleaned = clean_text_whitespace(text);
-                if !cleaned.is_empty() {
-                    // Split into words so wrapping works naturally
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    let cleaned = clean_text_whitespace(text);
                     let words = split_text_into_words(&cleaned);
                     for word in words {
                         root_box.children.push(LayoutBox::new(BoxType::TextFragment {
@@ -373,7 +410,15 @@ pub fn build_layout_tree<'a>(root: &'a StyledNode<'a>) -> Option<LayoutBox<'a>> 
                 }
             }
             NodeType::Element(_) => {
-                if let Some(child_box) = build_layout_tree(child) {
+                if child.node.tag_name() == Some("img") {
+                    let src = child.node.get_attribute("src").unwrap_or("").to_string();
+                    let alt = child.node.get_attribute("alt").unwrap_or("").to_string();
+                    root_box.children.push(LayoutBox::new(BoxType::ImageNode {
+                        src,
+                        alt,
+                        styled_node: child,
+                    }));
+                } else if let Some(child_box) = build_layout_tree(child) {
                     root_box.children.push(child_box);
                 }
             }
@@ -384,10 +429,29 @@ pub fn build_layout_tree<'a>(root: &'a StyledNode<'a>) -> Option<LayoutBox<'a>> 
     Some(root_box)
 }
 
+fn is_invisible_or_control(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'
+                | '\u{200C}'
+                | '\u{200D}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{00AD}'
+        )
+}
+
 fn clean_text_whitespace(s: &str) -> String {
     let mut result = String::new();
     let mut prev_whitespace = false;
     for c in s.chars() {
+        if is_invisible_or_control(c) {
+            continue;
+        }
         if c.is_whitespace() {
             if !prev_whitespace {
                 result.push(' ');
@@ -405,9 +469,11 @@ fn split_text_into_words(s: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     for c in s.chars() {
+        if is_invisible_or_control(c) {
+            continue;
+        }
         if c.is_whitespace() {
             if !current.is_empty() {
-                current.push(' ');
                 words.push(current);
                 current = String::new();
             }
@@ -426,12 +492,13 @@ pub fn estimate_text_width(text: &str, font_size: f32) -> f32 {
     let mut width = 0.0;
     for c in text.chars() {
         let factor = match c {
-            ' ' => 0.32,
-            'i' | 'l' | 'j' | '!' | '.' | ',' | ':' | ';' | '\'' | '|' => 0.28,
-            'f' | 'r' | 't' | '(' | ')' | '[' | ']' => 0.35,
-            'm' | 'w' | 'M' | 'W' => 0.85,
-            'A'..='Z' => 0.68,
-            _ => 0.53,
+            ' ' => 0.35,
+            'i' | 'l' | 'j' | '!' | '.' | ',' | ':' | ';' | '\'' | '|' | '’' => 0.30,
+            'f' | 'r' | 't' | '(' | ')' | '[' | ']' | '-' | '"' => 0.40,
+            'm' | 'w' | 'M' | 'W' => 0.95,
+            'A'..='Z' => 0.75,
+            '0'..='9' => 0.62,
+            _ => 0.60,
         };
         width += factor * font_size;
     }

@@ -29,6 +29,19 @@ impl<'a> StyledNode<'a> {
             if tag == "html" || tag == "body" {
                 return Display::Block;
             }
+            if matches!(
+                tag,
+                "head"
+                    | "meta"
+                    | "link"
+                    | "title"
+                    | "style"
+                    | "script"
+                    | "noscript"
+                    | "template"
+            ) {
+                return Display::None;
+            }
         }
 
         match self.value("display") {

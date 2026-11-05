@@ -22,12 +22,12 @@ fn test_html_parser_basic() {
 
 #[test]
 fn test_html_entities_and_void_tags() {
-    let html = r#"<p>&lt;Rust&gt; &amp; &quot;IronSurf&quot; &copy; 2026<br><img src="ferris.png"></p>"#;
+    let html = r#"<p>&lt;Rust&gt; &amp; &quot;Aether&quot; &copy; 2026<br><img src="ferris.png"></p>"#;
     let root = HtmlParser::parse(html);
     let p = &root.children[0];
 
     let text = p.children[0].inner_text();
-    assert!(text.contains("<Rust> & \"IronSurf\" © 2026"));
+    assert!(text.contains("<Rust> & \"Aether\" © 2026"));
 
     // Check void tags have no children
     let img = &p.children[2];
@@ -147,4 +147,101 @@ fn test_url_normalization_and_resolution() {
     assert_eq!(resolve_relative_url(base, "about:newtab"), "about:newtab");
     assert_eq!(resolve_relative_url(base, "next.html"), "https://example.com/blog/next.html");
     assert_eq!(resolve_relative_url(base, "/images/logo.png"), "https://example.com/images/logo.png");
+}
+
+#[test]
+fn test_metadata_elements_hidden() {
+    let html = r#"<html><head><title>Example Domain</title><style>body { background: #fff; }</style><script>console.log(1);</script></head><body><p>Visible content</p></body></html>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(rust_browser::default_style::DEFAULT_USER_AGENT_CSS);
+    let styled_root = style_tree(&dom, &stylesheet);
+
+    let layout_root = build_layout_tree(&styled_root).unwrap();
+
+    // Verify head, title, style, script nodes are NOT in layout tree
+    fn contains_tag(lb: &rust_browser::layout::LayoutBox, tag: &str) -> bool {
+        if let Some(sn) = lb.get_styled_node() {
+            if sn.node.tag_name() == Some(tag) {
+                return true;
+            }
+        }
+        lb.children.iter().any(|c| contains_tag(c, tag))
+    }
+
+    assert!(!contains_tag(&layout_root, "head"));
+    assert!(!contains_tag(&layout_root, "title"));
+    assert!(!contains_tag(&layout_root, "style"));
+    assert!(!contains_tag(&layout_root, "script"));
+    assert!(contains_tag(&layout_root, "p"));
+}
+
+#[test]
+fn test_text_word_spacing() {
+    let html = r#"<div><p>This domain is for use</p></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(rust_browser::default_style::DEFAULT_USER_AGENT_CSS);
+    let styled_root = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled_root).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 600.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    // Find the p box
+    let p_box = &layout_root.children[0].children[0];
+    assert_eq!(p_box.children.len(), 5); // 5 words: This, domain, is, for, use
+
+    // Ensure consecutive words have positive gap (never overlapping)
+    for i in 0..p_box.children.len() - 1 {
+        let cur = &p_box.children[i];
+        let next = &p_box.children[i + 1];
+        let cur_end_x = cur.dimensions.content.x + cur.dimensions.content.width;
+        let next_start_x = next.dimensions.content.x;
+        assert!(
+            next_start_x > cur_end_x,
+            "Word {} at {} collides with word {} ending at {}",
+            i + 1,
+            next_start_x,
+            i,
+            cur_end_x
+        );
+    }
+}
+
+#[test]
+fn test_image_layout_and_display_item() {
+    let html = r#"<div><img src="https://example.com/logo.png" width="120" height="80" alt="Logo"></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(rust_browser::default_style::DEFAULT_USER_AGENT_CSS);
+    let styled_root = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled_root).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 600.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let display_list = rust_browser::render::build_display_list(&layout_root);
+    let image_items: Vec<_> = display_list
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            rust_browser::render::DisplayItem::Image { rect, src, alt } => Some((rect, src, alt)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(image_items.len(), 1);
+    let (rect, src, alt) = image_items[0];
+    assert_eq!(src, "https://example.com/logo.png");
+    assert_eq!(alt, "Logo");
+    assert_eq!(rect.width, 120.0);
+    assert_eq!(rect.height, 80.0);
 }

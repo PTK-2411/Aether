@@ -78,6 +78,21 @@ impl Tab {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SelectedNodeInfo {
+    pub tag: String,
+    pub id: Option<String>,
+    pub class: Option<String>,
+    pub attributes: Vec<(String, String)>,
+    pub text_preview: Option<String>,
+    pub display: String,
+    pub font_size: String,
+    pub color: String,
+    pub bg_color: String,
+    pub margin: String,
+    pub padding: String,
+}
+
 pub struct BrowserApp {
     tabs: Vec<Tab>,
     active_tab_idx: usize,
@@ -89,9 +104,22 @@ pub struct BrowserApp {
     show_devtools: bool,
     devtools_tab: DevToolsTab,
     selected_dom_node: Option<String>,
+    selected_node_info: Option<SelectedNodeInfo>,
     zoom_level: f32,
     show_menu_popup: bool,
     show_more_shortcuts: bool,
+
+    image_textures: std::collections::HashMap<String, egui::TextureHandle>,
+    image_tx: std::sync::mpsc::Sender<(String, egui::ColorImage)>,
+    image_rx: std::sync::mpsc::Receiver<(String, egui::ColorImage)>,
+    loading_images: std::collections::HashSet<String>,
+
+    search_suggestions: Vec<String>,
+    suggest_query: String,
+    suggest_tx: std::sync::mpsc::Sender<(String, Vec<String>)>,
+    suggest_rx: std::sync::mpsc::Receiver<(String, Vec<String>)>,
+    show_omnibox_suggestions: bool,
+    show_center_suggestions: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -105,6 +133,9 @@ enum DevToolsTab {
 impl BrowserApp {
     pub fn new() -> Self {
         let network = NetworkManager::new();
+        let (img_tx, img_rx) = std::sync::mpsc::channel();
+        let (sug_tx, sug_rx) = std::sync::mpsc::channel();
+
         let mut app = BrowserApp {
             tabs: Vec::new(),
             active_tab_idx: 0,
@@ -116,9 +147,20 @@ impl BrowserApp {
             show_devtools: false,
             devtools_tab: DevToolsTab::DomTree,
             selected_dom_node: None,
+            selected_node_info: None,
             zoom_level: 1.0,
             show_menu_popup: false,
             show_more_shortcuts: false,
+            image_textures: std::collections::HashMap::new(),
+            image_tx: img_tx,
+            image_rx: img_rx,
+            loading_images: std::collections::HashSet::new(),
+            search_suggestions: Vec::new(),
+            suggest_query: String::new(),
+            suggest_tx: sug_tx,
+            suggest_rx: sug_rx,
+            show_omnibox_suggestions: false,
+            show_center_suggestions: false,
         };
 
         // Open initial New Tab
@@ -287,6 +329,205 @@ impl BrowserApp {
             }
         }
     }
+
+    pub fn trigger_suggestions(&mut self, query: &str) {
+        let q = query.trim().to_string();
+        if q.is_empty() || q.starts_with("http://") || q.starts_with("https://") || q.starts_with("about:") {
+            self.search_suggestions.clear();
+            self.suggest_query.clear();
+            return;
+        }
+        if q != self.suggest_query {
+            self.suggest_query = q.clone();
+            let tx = self.suggest_tx.clone();
+            std::thread::spawn(move || {
+                fetch_search_suggestions(&q, tx);
+            });
+        }
+    }
+
+    fn render_search_suggestions_dropdown(
+        &mut self,
+        ui: &mut egui::Ui,
+        target_rect: egui::Rect,
+        _is_omnibox: bool,
+    ) {
+        if self.search_suggestions.is_empty() {
+            return;
+        }
+
+        let width = target_rect.width();
+        let pos = Pos2::new(target_rect.min.x, target_rect.max.y + 4.0);
+        let mut navigate_to = None;
+
+        egui::Area::new(egui::Id::new("search_autocomplete_dropdown"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                Frame::NONE
+                    .fill(Color32::from_rgb(44, 46, 50))
+                    .corner_radius(12)
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(72, 75, 80)))
+                    .inner_margin(egui::Margin::symmetric(6, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        for suggestion in &self.search_suggestions {
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                Vec2::new(width - 12.0, 32.0),
+                                egui::Sense::click(),
+                            );
+
+                            if row_resp.hovered() {
+                                ui.painter().rect_filled(row_rect, 6.0, Color32::from_rgb(60, 64, 70));
+                            }
+
+                            // Vector magnifying glass
+                            let ic = Pos2::new(row_rect.min.x + 16.0, row_rect.center().y);
+                            ui.painter().circle_stroke(
+                                Pos2::new(ic.x - 1.0, ic.y - 1.0),
+                                4.5,
+                                Stroke::new(1.3_f32, Color32::from_rgb(154, 160, 166)),
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    Pos2::new(ic.x + 2.5, ic.y + 2.5),
+                                    Pos2::new(ic.x + 6.0, ic.y + 6.0),
+                                ],
+                                Stroke::new(1.5_f32, Color32::from_rgb(154, 160, 166)),
+                            );
+
+                            ui.painter().text(
+                                Pos2::new(row_rect.min.x + 36.0, row_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                suggestion,
+                                FontId::proportional(14.0),
+                                Color32::from_rgb(232, 234, 237),
+                            );
+
+                            if row_resp.clicked() {
+                                navigate_to = Some(suggestion.clone());
+                            }
+                        }
+                    });
+            });
+
+        if let Some(query) = navigate_to {
+            self.search_suggestions.clear();
+            self.show_omnibox_suggestions = false;
+            self.show_center_suggestions = false;
+            self.navigate_active_tab(&format!("https://search.aether.local/?q={}", query));
+        }
+    }
+}
+
+fn fetch_and_decode_image(src: &str, tx: std::sync::mpsc::Sender<(String, egui::ColorImage)>) {
+    if src.starts_with("data:image/") {
+        if let Some(comma_pos) = src.find(',') {
+            let data_part = &src[comma_pos + 1..];
+            if let Ok(bytes) = base64_decode(data_part) {
+                if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                    let rgba = dyn_img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
+                    let _ = tx.send((src.to_string(), color_img));
+                    return;
+                }
+            }
+        }
+    }
+
+    if src.starts_with("http://") || src.starts_with("https://") {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(6))
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build();
+        if let Ok(c) = client {
+            if let Ok(resp) = c.get(src).send() {
+                if let Ok(bytes) = resp.bytes() {
+                    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                        let rgba = dyn_img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
+                        let _ = tx.send((src.to_string(), color_img));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::new();
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for b in s.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b' ' | b'\n' | b'\r' => continue,
+            _ => return Err(()),
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+fn fetch_search_suggestions(query: &str, tx: std::sync::mpsc::Sender<(String, Vec<String>)>) {
+    let encoded = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+    let url = format!(
+        "https://suggestqueries.google.com/complete/search?client=firefox&q={}",
+        encoded
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build();
+
+    let mut suggestions = Vec::new();
+    if let Ok(c) = client {
+        if let Ok(resp) = c.get(&url).send() {
+            if let Ok(text) = resp.text() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(arr) = val.get(1).and_then(|v| v.as_array()) {
+                        for item in arr.iter().take(6) {
+                            if let Some(s) = item.as_str() {
+                                suggestions.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if suggestions.is_empty() {
+        let local_database = [
+            "aether browser", "aether ai", "aether pure rust browser",
+            "rust programming language", "rustlang documentation", "rust cargo book",
+            "wikipedia", "wikipedia english",
+            "youtube", "youtube music", "github", "github rust", "reddit",
+            "crates.io", "web standards w3c", "html5 css3 layout",
+            "computer science", "artificial intelligence", "quantum computing",
+        ];
+        let q_lower = query.to_lowercase();
+        for &item in &local_database {
+            if item.to_lowercase().contains(&q_lower) && item != query {
+                suggestions.push(item.to_string());
+                if suggestions.len() >= 5 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = tx.send((query.to_string(), suggestions));
 }
 
 fn collect_style_tags(node: &Node, out: &mut String) {
@@ -306,6 +547,55 @@ impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_network_responses();
 
+        // Drain incoming decoded images
+        while let Ok((src, img)) = self.image_rx.try_recv() {
+            let handle = ctx.load_texture(&src, img, egui::TextureOptions::LINEAR);
+            self.image_textures.insert(src.clone(), handle);
+            self.loading_images.remove(&src);
+            ctx.request_repaint();
+        }
+
+        // Drain incoming search suggestions
+        while let Ok((query, suggestions)) = self.suggest_rx.try_recv() {
+            if query == self.suggest_query {
+                self.search_suggestions = suggestions;
+                ctx.request_repaint();
+            }
+        }
+
+        // Look for unrendered images in active tab's display list and trigger downloads
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            if let Some(ref dl) = tab.display_list {
+                for item in &dl.items {
+                    if let crate::render::DisplayItem::Image { src, .. } = item {
+                        if !src.is_empty()
+                            && !self.image_textures.contains_key(src)
+                            && !self.loading_images.contains(src)
+                        {
+                            self.loading_images.insert(src.clone());
+                            let src_c = src.clone();
+                            let tx = self.image_tx.clone();
+                            std::thread::spawn(move || {
+                                fetch_and_decode_image(&src_c, tx);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dynamically update window title to "Page Title - Aether"
+        let title = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            if tab.is_new_tab() {
+                "Aether".to_string()
+            } else {
+                format!("{} - Aether", tab.title)
+            }
+        } else {
+            "Aether".to_string()
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+
         // Apply dark mode visuals matching Google Chrome dark theme
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(Color32::from_rgb(232, 234, 237));
@@ -322,28 +612,28 @@ impl eframe::App for BrowserApp {
         egui::TopBottomPanel::top("chrome_top_panel")
             .frame(Frame::NONE.fill(Color32::from_rgb(32, 33, 36)))
             .show(ctx, |ui| {
-                self.render_tab_strip(ui);
+                self.render_tab_strip(ui, ctx);
                 self.render_navigation_bar(ui, ctx);
             });
 
         // DevTools side panel if open
         if self.show_devtools {
             egui::SidePanel::right("devtools_panel")
-                .default_width(380.0)
-                .min_width(280.0)
+                .default_width(420.0)
+                .min_width(320.0)
                 .frame(Frame::NONE.fill(Color32::from_rgb(28, 30, 33)))
                 .show(ctx, |ui| {
                     self.render_devtools(ui);
                 });
         }
 
-        // Main Web Viewport or Google New Tab Start Page
+        // Main Web Viewport or Aether New Tab Start Page
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(Color32::from_rgb(53, 54, 58))) // #35363a
             .show(ctx, |ui| {
                 let is_new_tab = self.tabs.get(self.active_tab_idx).map_or(true, |t| t.is_new_tab());
                 if is_new_tab {
-                    self.render_google_new_tab_page(ui, ctx);
+                    self.render_aether_new_tab_page(ui, ctx);
                 } else {
                     self.render_page_viewport(ui, ctx);
                 }
@@ -352,8 +642,8 @@ impl eframe::App for BrowserApp {
 }
 
 impl BrowserApp {
-    /// Renders the Chrome Tab Strip (Tabs, + Button, Window Controls)
-    fn render_tab_strip(&mut self, ui: &mut egui::Ui) {
+    /// Renders the Aether Tab Strip (Tabs, + Button, Draggable Header, and Window Controls)
+    fn render_tab_strip(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let mut close_tab_idx = None;
@@ -387,14 +677,14 @@ impl BrowserApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
 
-                        // Google "G" icon or globe
+                        // Aether "A" icon or loading dot
                         if tab.is_loading {
                             ui.label(RichText::new("●").size(10.0).color(Color32::from_rgb(251, 188, 4)));
                         } else if tab.is_new_tab() {
-                            // Mini Google G circle
-                            let (g_rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
-                            ui.painter().circle_filled(g_rect.center(), 7.0, Color32::from_rgb(66, 133, 244));
-                            ui.painter().text(g_rect.center(), Align2::CENTER_CENTER, "G", FontId::proportional(9.0), Color32::WHITE);
+                            // Mini Aether A circle
+                            let (a_rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
+                            ui.painter().circle_filled(a_rect.center(), 7.0, Color32::from_rgb(138, 180, 248));
+                            ui.painter().text(a_rect.center(), Align2::CENTER_CENTER, "A", FontId::proportional(9.0), Color32::from_rgb(20, 21, 24));
                         } else {
                             let (w_rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
                             ui.painter().circle_stroke(w_rect.center(), 6.0, Stroke::new(1.0_f32, Color32::from_rgb(154, 160, 166)));
@@ -416,7 +706,7 @@ impl BrowserApp {
                             self.address_input = if tab.is_new_tab() { String::new() } else { tab.url.clone() };
                         }
 
-                        // Vector Close button 'x' (Guaranteed 100% vector drawn, NEVER a box)
+                        // Tab Close button 'x' (Guaranteed 100% vector drawn)
                         let (c_rect, c_resp) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::click());
                         let center = c_rect.center();
                         if c_resp.hovered() {
@@ -451,29 +741,67 @@ impl BrowserApp {
                 self.open_new_tab("about:newtab".to_string());
             }
 
+            // Draggable strip & Window Controls (Minimize, Maximize, Close)
+            let controls_width = 114.0;
+            let available_drag_w = (ui.available_width() - controls_width).max(0.0);
+
+            // Empty tab bar space: Draggable window region
+            let (_drag_rect, drag_resp) = ui.allocate_exact_size(Vec2::new(available_drag_w, 28.0), egui::Sense::click_and_drag());
+            if drag_resp.dragged() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if drag_resp.double_clicked() {
+                let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+            }
+
             // Right-side window controls (Minimize, Maximize, Close - vector drawn)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(8.0);
-
                 // Window close
-                let (w_close_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::click());
+                let (w_close_rect, w_close_resp) = ui.allocate_exact_size(Vec2::new(38.0, 28.0), egui::Sense::click());
+                if w_close_resp.hovered() {
+                    ui.painter().rect_filled(w_close_rect, 0.0, Color32::from_rgb(232, 17, 35));
+                }
                 let wc = w_close_rect.center();
-                ui.painter().line_segment([wc - Vec2::splat(3.5), wc + Vec2::splat(3.5)], Stroke::new(1.2_f32, Color32::from_rgb(154, 160, 166)));
-                ui.painter().line_segment([Pos2::new(wc.x - 3.5, wc.y + 3.5), Pos2::new(wc.x + 3.5, wc.y - 3.5)], Stroke::new(1.2_f32, Color32::from_rgb(154, 160, 166)));
-
-                ui.add_space(10.0);
+                let close_color = if w_close_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(180, 185, 190) };
+                ui.painter().line_segment([wc - Vec2::splat(4.0), wc + Vec2::splat(4.0)], Stroke::new(1.3_f32, close_color));
+                ui.painter().line_segment([Pos2::new(wc.x - 4.0, wc.y + 4.0), Pos2::new(wc.x + 4.0, wc.y - 4.0)], Stroke::new(1.3_f32, close_color));
+                if w_close_resp.clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
 
                 // Window maximize
-                let (w_max_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::click());
-                let wm_box = egui::Rect::from_center_size(w_max_rect.center(), Vec2::new(8.0, 8.0));
-                ui.painter().rect_stroke(wm_box, 1.0_f32, Stroke::new(1.2_f32, Color32::from_rgb(154, 160, 166)), StrokeKind::Inside);
-
-                ui.add_space(10.0);
+                let (w_max_rect, w_max_resp) = ui.allocate_exact_size(Vec2::new(36.0, 28.0), egui::Sense::click());
+                if w_max_resp.hovered() {
+                    ui.painter().rect_filled(w_max_rect, 0.0, Color32::from_rgb(60, 64, 67));
+                }
+                let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                let max_color = if w_max_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(180, 185, 190) };
+                if is_maximized {
+                    let b1 = egui::Rect::from_center_size(Pos2::new(w_max_rect.center().x + 2.0, w_max_rect.center().y - 2.0), Vec2::new(8.0, 8.0));
+                    let b2 = egui::Rect::from_center_size(Pos2::new(w_max_rect.center().x - 2.0, w_max_rect.center().y + 2.0), Vec2::new(8.0, 8.0));
+                    ui.painter().rect_stroke(b1, 0.0, Stroke::new(1.1_f32, max_color), StrokeKind::Inside);
+                    ui.painter().rect_filled(b2, 0.0, if w_max_resp.hovered() { Color32::from_rgb(60, 64, 67) } else { Color32::from_rgb(32, 33, 36) });
+                    ui.painter().rect_stroke(b2, 0.0, Stroke::new(1.1_f32, max_color), StrokeKind::Inside);
+                } else {
+                    let wm_box = egui::Rect::from_center_size(w_max_rect.center(), Vec2::new(9.0, 9.0));
+                    ui.painter().rect_stroke(wm_box, 0.0, Stroke::new(1.2_f32, max_color), StrokeKind::Inside);
+                }
+                if w_max_resp.clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                }
 
                 // Window minimize
-                let (w_min_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::click());
+                let (w_min_rect, w_min_resp) = ui.allocate_exact_size(Vec2::new(36.0, 28.0), egui::Sense::click());
+                if w_min_resp.hovered() {
+                    ui.painter().rect_filled(w_min_rect, 0.0, Color32::from_rgb(60, 64, 67));
+                }
                 let wmc = w_min_rect.center();
-                ui.painter().line_segment([Pos2::new(wmc.x - 4.0, wmc.y), Pos2::new(wmc.x + 4.0, wmc.y)], Stroke::new(1.2_f32, Color32::from_rgb(154, 160, 166)));
+                let min_color = if w_min_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(180, 185, 190) };
+                ui.painter().line_segment([Pos2::new(wmc.x - 5.0, wmc.y), Pos2::new(wmc.x + 5.0, wmc.y)], Stroke::new(1.3_f32, min_color));
+                if w_min_resp.clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
             });
         });
     }
@@ -552,8 +880,8 @@ impl BrowserApp {
             let child_rect = response.rect.shrink2(Vec2::new(10.0, 4.0));
             let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(child_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
 
-            // Google "G" icon on left
-            child_ui.label(RichText::new("G").size(14.0).strong().color(Color32::from_rgb(66, 133, 244)));
+            // Aether "A" icon on left
+            child_ui.label(RichText::new("A").size(14.0).strong().color(Color32::from_rgb(138, 180, 248)));
             child_ui.add_space(6.0);
 
             // URL TextEdit
@@ -561,12 +889,20 @@ impl BrowserApp {
             let text_edit = child_ui.add_sized(
                 Vec2::new(available_edit_w.max(50.0), 24.0),
                 egui::TextEdit::singleline(&mut self.address_input)
-                    .hint_text("Search Google or type a URL")
+                    .hint_text("Search with Aether or type a URL")
                     .frame(false)
                     .text_color(Color32::from_rgb(232, 234, 237)),
             );
 
+            if text_edit.changed() {
+                self.show_omnibox_suggestions = true;
+                let input = self.address_input.clone();
+                self.trigger_suggestions(&input);
+            }
+
             if text_edit.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) {
+                self.show_omnibox_suggestions = false;
+                self.search_suggestions.clear();
                 let target = self.address_input.clone();
                 self.navigate_active_tab(&target);
             }
@@ -575,7 +911,7 @@ impl BrowserApp {
             child_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |child_ui| {
                 let ai_pill = child_ui.add(
                     egui::Button::new(
-                        RichText::new("AI Mode")
+                        RichText::new("✦ AI Mode")
                             .size(11.0)
                             .color(Color32::from_rgb(168, 199, 250)),
                     )
@@ -584,7 +920,7 @@ impl BrowserApp {
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(95, 99, 104))),
                 );
                 if ai_pill.clicked() {
-                    self.navigate_active_tab("https://gemini.google.com");
+                    self.navigate_active_tab("about:ai");
                 }
             });
 
@@ -659,19 +995,23 @@ impl BrowserApp {
                         });
                     });
             }
+
+            if self.show_omnibox_suggestions && !self.search_suggestions.is_empty() {
+                self.render_search_suggestions_dropdown(ui, response.rect, true);
+            }
         });
         ui.add_space(4.0);
     }
 
-    /// Renders the exact Google Dark Mode Start Page from Image 3
-    fn render_google_new_tab_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// Renders the Aether Dark Mode Start Page
+    fn render_aether_new_tab_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ScrollArea::vertical().show(ui, |ui| {
-            // Top Right Bar: Gmail, Images, 9-dot App Grid, Profile Picture
+            // Top Right Bar: Aether AI, Architecture, Test Suite, DevTools Toggle, Profile Picture
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(16.0);
 
-                    // Profile Circle with landscape / avatar and blue border
+                    // Profile Circle with avatar and blue border
                     let (profile_rect, profile_resp) = ui.allocate_exact_size(Vec2::new(32.0, 32.0), egui::Sense::click());
                     let p_center = profile_rect.center();
                     ui.painter().circle_filled(p_center, 15.0, Color32::from_rgb(66, 133, 244));
@@ -683,7 +1023,7 @@ impl BrowserApp {
 
                     ui.add_space(8.0);
 
-                    // 9-dot Grid Icon (Google Apps)
+                    // 9-dot Grid Icon (Aether Hub)
                     let (grid_rect, grid_resp) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), egui::Sense::click());
                     let g_center = grid_rect.center();
                     for r in -1..=1 {
@@ -693,38 +1033,61 @@ impl BrowserApp {
                         }
                     }
                     if grid_resp.clicked() {
-                        self.navigate_active_tab("https://about.google/products/");
+                        self.navigate_active_tab("about:credits");
                     }
 
                     ui.add_space(8.0);
 
-                    // Images link
-                    if ui.add(egui::Link::new(RichText::new("Images").size(13.0).color(Color32::from_rgb(232, 234, 237)))).clicked() {
-                        self.navigate_active_tab("https://images.google.com");
+                    // Test Suite link
+                    if ui.add(egui::Link::new(RichText::new("Test Suite").size(13.0).color(Color32::from_rgb(232, 234, 237)))).clicked() {
+                        self.navigate_active_tab("about:test");
                     }
 
                     ui.add_space(8.0);
 
-                    // Gmail link
-                    if ui.add(egui::Link::new(RichText::new("Gmail").size(13.0).color(Color32::from_rgb(232, 234, 237)))).clicked() {
-                        self.navigate_active_tab("https://mail.google.com");
+                    // Architecture link
+                    if ui.add(egui::Link::new(RichText::new("Architecture").size(13.0).color(Color32::from_rgb(232, 234, 237)))).clicked() {
+                        self.navigate_active_tab("about:credits");
+                    }
+
+                    ui.add_space(8.0);
+
+                    // Aether AI link
+                    if ui.add(egui::Link::new(RichText::new("✦ Aether AI").size(13.0).color(Color32::from_rgb(168, 199, 250)))).clicked() {
+                        self.navigate_active_tab("about:ai");
                     }
                 });
             });
 
-            ui.add_space(50.0);
+            ui.add_space(44.0);
 
             // Center Content Container
             ui.vertical_centered(|ui| {
-                // 1. "Google" Logo: Big prominent clean white text matching Image 3
+                // 1. "Aether" Brand Logo: Sleek modern typography with orbital crest
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let logo_w = 260.0;
+                    let pad = ((ui.available_width() - logo_w) / 2.0).max(0.0);
+                    ui.add_space(pad);
+
+                    let (crest_rect, _) = ui.allocate_exact_size(Vec2::new(42.0, 42.0), egui::Sense::hover());
+                    draw_sparkle_icon(ui.painter(), crest_rect.center(), 18.0, Color32::from_rgb(138, 180, 248));
+
+                    ui.label(
+                        RichText::new("Aether")
+                            .size(64.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                });
+                ui.add_space(2.0);
                 ui.label(
-                    RichText::new("Google")
-                        .size(80.0)
-                        .strong()
-                        .color(Color32::WHITE),
+                    RichText::new("100% Pure Rust Web Browser • Zero Chromium")
+                        .size(13.0)
+                        .color(Color32::from_rgb(154, 160, 166)),
                 );
 
-                ui.add_space(26.0);
+                ui.add_space(24.0);
 
                 // 2. Center Search Bar (Large Pill Shape ~680px wide)
                 let search_box_width = (680.0_f32).min(ui.available_width() - 32.0);
@@ -745,18 +1108,26 @@ impl BrowserApp {
                 inner_ui.label(RichText::new("+").size(18.0).color(Color32::from_rgb(154, 160, 166)));
                 inner_ui.add_space(10.0);
 
-                // Text Edit: "Ask Google"
+                // Text Edit: "Search with Aether or type a URL"
                 let input_width = inner_ui.available_width() - 175.0;
                 let center_edit = inner_ui.add_sized(
                     Vec2::new(input_width.max(100.0), 30.0),
                     egui::TextEdit::singleline(&mut self.center_search_input)
-                        .hint_text("Ask Google")
+                        .hint_text("Search with Aether or type a URL")
                         .frame(false)
                         .text_color(Color32::WHITE)
-                        .font(FontId::proportional(16.0)),
+                        .font(FontId::proportional(15.0)),
                 );
 
+                if center_edit.changed() {
+                    self.show_center_suggestions = true;
+                    let input = self.center_search_input.clone();
+                    self.trigger_suggestions(&input);
+                }
+
                 if center_edit.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    self.show_center_suggestions = false;
+                    self.search_suggestions.clear();
                     let query = self.center_search_input.clone();
                     if !query.trim().is_empty() {
                         self.navigate_active_tab(&query);
@@ -767,16 +1138,16 @@ impl BrowserApp {
                 inner_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |inner_ui| {
                     let ai_btn = inner_ui.add(
                         egui::Button::new(
-                            RichText::new("AI Mode")
+                            RichText::new("✦ AI Mode")
                                 .size(12.0)
-                                .color(Color32::from_rgb(232, 234, 237)),
+                                .color(Color32::from_rgb(168, 199, 250)),
                         )
                         .fill(Color32::from_rgb(55, 57, 60))
                         .corner_radius(14)
                         .stroke(Stroke::new(1.0_f32, Color32::from_rgb(95, 99, 104))),
                     );
                     if ai_btn.clicked() {
-                        self.navigate_active_tab("https://gemini.google.com");
+                        self.navigate_active_tab("about:ai");
                     }
 
                     inner_ui.add_space(8.0);
@@ -788,7 +1159,7 @@ impl BrowserApp {
                     inner_ui.painter().rect_stroke(cam_box, 2.0_f32, Stroke::new(1.2_f32, Color32::from_rgb(180, 185, 190)), StrokeKind::Inside);
                     inner_ui.painter().circle_stroke(cc, 2.5, Stroke::new(1.2_f32, Color32::from_rgb(180, 185, 190)));
                     if cam_resp.clicked() {
-                        self.navigate_active_tab("https://lens.google.com");
+                        self.navigate_active_tab("about:ai");
                     }
 
                     inner_ui.add_space(8.0);
@@ -801,6 +1172,10 @@ impl BrowserApp {
                     inner_ui.painter().line_segment([Pos2::new(mc.x, mc.y + 4.0), Pos2::new(mc.x, mc.y + 7.0)], Stroke::new(1.2_f32, Color32::from_rgb(180, 185, 190)));
                 });
 
+                if self.show_center_suggestions && !self.search_suggestions.is_empty() {
+                    self.render_search_suggestions_dropdown(ui, search_rect, false);
+                }
+
                 ui.add_space(18.0);
 
                 // 3. Two Suggestion Action Chips (Cards underneath search bar)
@@ -812,7 +1187,7 @@ impl BrowserApp {
                     let left_pad = ((ui.available_width() - total_chips_w) / 2.0).max(0.0);
                     ui.add_space(left_pad);
 
-                    // Chip 1: "Do more with AI Mode - Create, summarize, plan"
+                    // Chip 1: "Aether AI Assistant"
                     let chip1 = Frame::NONE
                         .fill(Color32::from_rgb(48, 50, 54))
                         .corner_radius(16)
@@ -824,17 +1199,17 @@ impl BrowserApp {
                                 draw_sparkle_icon(ui.painter(), star_rect.center(), 7.0, Color32::from_rgb(168, 199, 250));
                                 ui.add_space(4.0);
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new("Do more with AI Mode").size(12.0).strong().color(Color32::WHITE));
-                                    ui.label(RichText::new("Create, summarize, plan").size(10.0).color(Color32::from_rgb(154, 160, 166)));
+                                    ui.label(RichText::new("Aether AI Assistant").size(12.0).strong().color(Color32::WHITE));
+                                    ui.label(RichText::new("Instant search, summaries & intelligence").size(10.0).color(Color32::from_rgb(154, 160, 166)));
                                 });
                             });
                         });
 
                     if chip1.response.interact(egui::Sense::click()).clicked() {
-                        self.navigate_active_tab("https://gemini.google.com");
+                        self.navigate_active_tab("about:ai");
                     }
 
-                    // Chip 2: "Create images - Reimagine, illustrate, edit"
+                    // Chip 2: "Explore Open Web"
                     let chip2 = Frame::NONE
                         .fill(Color32::from_rgb(48, 50, 54))
                         .corner_radius(16)
@@ -846,20 +1221,20 @@ impl BrowserApp {
                                 draw_camera_icon(ui.painter(), cam_chip.center(), 6.0, Color32::from_rgb(241, 180, 70));
                                 ui.add_space(4.0);
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new("Create images").size(12.0).strong().color(Color32::WHITE));
-                                    ui.label(RichText::new("Reimagine, illustrate, edit").size(10.0).color(Color32::from_rgb(154, 160, 166)));
+                                    ui.label(RichText::new("Explore Open Web").size(12.0).strong().color(Color32::WHITE));
+                                    ui.label(RichText::new("Acid test suite & layout verification").size(10.0).color(Color32::from_rgb(154, 160, 166)));
                                 });
                             });
                         });
 
                     if chip2.response.interact(egui::Sense::click()).clicked() {
-                        self.navigate_active_tab("https://images.google.com");
+                        self.navigate_active_tab("about:test");
                     }
                 });
 
                 ui.add_space(28.0);
 
-                // 4. Seven Quick Shortcut Icons (Row of circles with vector graphics)
+                // 4. Quick Shortcut Icons (Row of circles with vector graphics)
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 24.0;
 
@@ -867,69 +1242,67 @@ impl BrowserApp {
                     let pad_shortcuts = ((ui.available_width() - total_shortcuts_w) / 2.0).max(0.0);
                     ui.add_space(pad_shortcuts);
 
-                    // 1. Facebook
+                    // 1. Wikipedia
                     render_vector_shortcut(
                         ui,
-                        VectorIcon::Letter("f"),
-                        Color32::from_rgb(24, 119, 242), // FB blue
-                        "Facebook",
-                        || self.navigate_active_tab("https://facebook.com"),
+                        VectorIcon::Letter("W"),
+                        Color32::from_rgb(0, 102, 153),
+                        "Wikipedia",
+                        || self.navigate_active_tab("https://en.wikipedia.org"),
                     );
 
                     // 2. YouTube
                     render_vector_shortcut(
                         ui,
                         VectorIcon::PlayTriangle,
-                        Color32::from_rgb(255, 0, 0), // YouTube red
+                        Color32::from_rgb(255, 0, 0),
                         "YouTube",
                         || self.navigate_active_tab("https://youtube.com"),
                     );
 
-                    // 3. Trang chủ
+                    // 3. GitHub
                     render_vector_shortcut(
                         ui,
-                        VectorIcon::Letter("C"),
-                        Color32::from_rgb(0, 128, 128), // Teal
-                        "Trang chủ",
-                        || self.navigate_active_tab("about:test"),
+                        VectorIcon::Letter("GH"),
+                        Color32::from_rgb(36, 41, 46),
+                        "GitHub",
+                        || self.navigate_active_tab("https://github.com"),
                     );
 
-                    // 4. Google Colab
+                    // 4. Rust Lang
                     render_vector_shortcut(
                         ui,
-                        VectorIcon::Infinity,
-                        Color32::from_rgb(227, 116, 0), // Amber
-                        "Google Colab",
-                        || self.navigate_active_tab("https://colab.research.google.com"),
+                        VectorIcon::Letter("R"),
+                        Color32::from_rgb(222, 90, 38),
+                        "Rust Lang",
+                        || self.navigate_active_tab("https://www.rust-lang.org"),
                     );
 
-                    // 5. Google Gemini
+                    // 5. Aether AI
                     render_vector_shortcut(
                         ui,
                         VectorIcon::Sparkle,
-                        Color32::from_rgb(66, 133, 244), // Gemini blue
-                        "Google Gemini",
-                        || self.navigate_active_tab("https://gemini.google.com"),
+                        Color32::from_rgb(66, 133, 244),
+                        "Aether AI",
+                        || self.navigate_active_tab("about:ai"),
                     );
 
-                    // 6. Instagram
+                    // 6. Reddit
                     render_vector_shortcut(
                         ui,
-                        VectorIcon::Camera,
-                        Color32::from_rgb(214, 41, 118), // Instagram magenta
-                        "Instagram",
-                        || self.navigate_active_tab("https://instagram.com"),
+                        VectorIcon::Letter("r/"),
+                        Color32::from_rgb(255, 69, 0),
+                        "Reddit",
+                        || self.navigate_active_tab("https://reddit.com"),
                     );
 
-                    // 7. Show more
+                    // 7. DuckDuckGo
                     render_vector_shortcut(
                         ui,
-                        VectorIcon::Plus,
-                        Color32::from_rgb(60, 64, 67), // Dark grey
-                        "Show more",
-                        || {
-                            self.show_more_shortcuts = !self.show_more_shortcuts;
-                        },
+                        VectorIcon::Letter("D"),
+                        Color32::from_rgb(222, 88, 51),
+                        "DuckDuckGo",
+                        || self.navigate_active_tab("https://duckduckgo.com"),
                     );
                 });
 
@@ -943,18 +1316,18 @@ impl BrowserApp {
 
                         render_vector_shortcut(
                             ui,
-                            VectorIcon::Letter("G"),
-                            Color32::from_rgb(66, 133, 244),
-                            "Google",
-                            || self.navigate_active_tab("https://google.com"),
+                            VectorIcon::Letter("Y"),
+                            Color32::from_rgb(255, 102, 0),
+                            "Hacker News",
+                            || self.navigate_active_tab("https://news.ycombinator.com"),
                         );
 
                         render_vector_shortcut(
                             ui,
-                            VectorIcon::Letter("R"),
-                            Color32::from_rgb(230, 80, 40),
-                            "Rust Lang",
-                            || self.navigate_active_tab("https://rust-lang.org"),
+                            VectorIcon::Letter("C"),
+                            Color32::from_rgb(167, 66, 18),
+                            "Crates.io",
+                            || self.navigate_active_tab("https://crates.io"),
                         );
 
                         render_vector_shortcut(
@@ -976,14 +1349,14 @@ impl BrowserApp {
                 }
             });
 
-            // 5. Bottom Right: "Customize Chrome" Button
+            // 5. Bottom Right: "Customize Aether" Button
             ui.add_space(60.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(20.0);
                     let customize_btn = ui.add(
                         egui::Button::new(
-                            RichText::new("Customize Chrome")
+                            RichText::new("Customize Aether")
                                 .size(12.0)
                                 .color(Color32::from_rgb(232, 234, 237)),
                         )
@@ -1025,13 +1398,23 @@ impl BrowserApp {
                 );
 
                 // Webpage canvas background
-                painter.rect_filled(response.rect, 0.0, Color32::WHITE);
+                let canvas_bg = if current_tab.url.contains("search.aether.local")
+                    || current_tab.url.contains("google.com/search")
+                    || current_tab.url.contains("about:ai")
+                {
+                    Color32::from_rgb(32, 33, 36)
+                } else if current_tab.url.contains("about:credits") {
+                    Color32::from_rgb(15, 23, 42)
+                } else {
+                    Color32::WHITE
+                };
+                painter.rect_filled(response.rect, 0.0, canvas_bg);
 
                 let origin = response.rect.min;
                 let offset = Vec2::new(origin.x, origin.y);
 
                 if let Some(ref display_list) = current_tab.display_list {
-                    paint_display_list(&painter, display_list, offset, self.zoom_level);
+                    paint_display_list(&painter, display_list, offset, self.zoom_level, Some(&self.image_textures));
 
                     if let Some(mouse_pos) = ctx.pointer_hover_pos() {
                         let rel_x = (mouse_pos.x - offset.x) / self.zoom_level;
@@ -1060,27 +1443,51 @@ impl BrowserApp {
         }
     }
 
-    /// Renders the DevTools Inspector
+    /// Renders the DevTools Inspector with clearly divided frames and visual panels
     fn render_devtools(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
+        // DevTools Header Bar
         ui.horizontal(|ui| {
-            ui.heading(RichText::new("DevTools").size(16.0).color(Color32::WHITE));
+            ui.add_space(4.0);
+            ui.heading(RichText::new("Aether DevTools").size(16.0).color(Color32::WHITE));
+            let (f12_rect, _) = ui.allocate_exact_size(Vec2::new(34.0, 18.0), egui::Sense::hover());
+            ui.painter().rect_filled(f12_rect, 4.0, Color32::from_rgb(45, 48, 54));
+            ui.painter().text(f12_rect.center(), Align2::CENTER_CENTER, "F12", FontId::proportional(10.0), Color32::from_rgb(168, 199, 250));
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("✕").clicked() {
+                ui.add_space(4.0);
+                let (c_rect, c_resp) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), egui::Sense::click());
+                let center = c_rect.center();
+                if c_resp.hovered() {
+                    ui.painter().circle_filled(center, 10.0, Color32::from_rgb(60, 64, 67));
+                }
+                ui.painter().line_segment(
+                    [Pos2::new(center.x - 4.0, center.y - 4.0), Pos2::new(center.x + 4.0, center.y + 4.0)],
+                    Stroke::new(1.5_f32, Color32::from_rgb(200, 205, 210)),
+                );
+                ui.painter().line_segment(
+                    [Pos2::new(center.x + 4.0, center.y - 4.0), Pos2::new(center.x - 4.0, center.y + 4.0)],
+                    Stroke::new(1.5_f32, Color32::from_rgb(200, 205, 210)),
+                );
+                if c_resp.clicked() {
                     self.show_devtools = false;
                 }
             });
         });
 
         ui.add_space(6.0);
+        // Navigation Tab Bar with cleanly styled pills
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::DomTree, "DOM");
-            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Styles, "CSS");
-            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Source, "Source");
-            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Network, "Network");
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::DomTree, "DOM Tree");
+            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Styles, "CSS Rules");
+            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Source, "HTML Source");
+            ui.selectable_value(&mut self.devtools_tab, DevToolsTab::Network, "Diagnostics");
         });
 
+        ui.add_space(6.0);
         ui.separator();
+        ui.add_space(6.0);
 
         let tab = match self.tabs.get(self.active_tab_idx) {
             Some(t) => t,
@@ -1089,50 +1496,244 @@ impl BrowserApp {
 
         match self.devtools_tab {
             DevToolsTab::DomTree => {
-                ScrollArea::both().show(ui, |ui| {
-                    if let Some(ref dom) = tab.dom_root {
-                        render_dom_node_ui(ui, dom, 0, &mut self.selected_dom_node);
-                    } else {
-                        ui.label(RichText::new("No DOM available on New Tab page").weak());
-                    }
-                });
+                let mut clicked_node = None;
+
+                // Frame 1: DOM Hierarchy Container
+                Frame::NONE
+                    .fill(Color32::from_rgb(22, 24, 27))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("📁 DOM Hierarchy Tree").strong().size(13.0).color(Color32::from_rgb(232, 234, 237)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new("Click node to inspect").weak().size(11.0));
+                            });
+                        });
+                        ui.separator();
+                        ScrollArea::both()
+                            .max_height(250.0)
+                            .show(ui, |ui| {
+                                if let Some(ref dom) = tab.dom_root {
+                                    render_dom_node_ui(ui, dom, 0, &self.selected_dom_node, &mut clicked_node);
+                                } else {
+                                    ui.label(RichText::new("No DOM available on New Tab page").weak());
+                                }
+                            });
+                    });
+
+                if let Some(node_info) = clicked_node {
+                    self.selected_dom_node = Some(node_info.tag.clone());
+                    self.selected_node_info = Some(node_info);
+                }
+
+                ui.add_space(10.0);
+
+                // Frame 2: Element Inspector & Box Model Container
+                Frame::NONE
+                    .fill(Color32::from_rgb(24, 26, 30))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🔍 Element Inspector").strong().size(13.0).color(Color32::from_rgb(232, 234, 237)));
+                            if let Some(ref info) = self.selected_node_info {
+                                let badge_text = if let Some(ref id) = info.id {
+                                    format!("<{} id=\"{}\">", info.tag, id)
+                                } else if let Some(ref class) = info.class {
+                                    format!("<{} class=\"{}\">", info.tag, class)
+                                } else {
+                                    format!("<{}>", info.tag)
+                                };
+                                ui.label(
+                                    RichText::new(badge_text)
+                                        .strong()
+                                        .color(Color32::from_rgb(138, 180, 248)),
+                                );
+                            } else {
+                                ui.label(RichText::new("<none selected>").weak());
+                            }
+                        });
+                        ui.separator();
+
+                        if let Some(ref info) = self.selected_node_info {
+                            ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                // 1. Box Model Card
+                                ui.label(RichText::new("Chrome Box Model:").small().strong().color(Color32::from_rgb(154, 160, 166)));
+                                render_box_model_diagram(ui, &info.margin, &info.padding, &info.display);
+
+                                ui.add_space(10.0);
+
+                                // 2. Attributes Card
+                                if !info.attributes.is_empty() {
+                                    ui.label(RichText::new("HTML Attributes:").small().strong().color(Color32::from_rgb(154, 160, 166)));
+                                    Frame::NONE
+                                        .fill(Color32::from_rgb(18, 19, 22))
+                                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 42, 46)))
+                                        .corner_radius(4)
+                                        .inner_margin(egui::Margin::symmetric(8, 6))
+                                        .show(ui, |ui| {
+                                            for (k, v) in &info.attributes {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(RichText::new(k).strong().color(Color32::from_rgb(168, 199, 250)));
+                                                    ui.label(RichText::new(format!("= \"{}\"", v)).color(Color32::from_rgb(200, 205, 210)));
+                                                });
+                                            }
+                                        });
+                                    ui.add_space(8.0);
+                                }
+
+                                // 3. Computed Styles Card
+                                ui.label(RichText::new("Computed CSS Properties:").small().strong().color(Color32::from_rgb(154, 160, 166)));
+                                Frame::NONE
+                                    .fill(Color32::from_rgb(18, 19, 22))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 42, 46)))
+                                    .corner_radius(4)
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(RichText::new(format!("display: {}", info.display)).color(Color32::from_rgb(129, 201, 149)));
+                                            ui.separator();
+                                            ui.label(RichText::new(format!("color: {}", info.color)).color(Color32::from_rgb(253, 214, 99)));
+                                            ui.separator();
+                                            ui.label(RichText::new(format!("font-size: {}", info.font_size)).color(Color32::from_rgb(138, 180, 248)));
+                                            ui.separator();
+                                            ui.label(RichText::new(format!("background: {}", info.bg_color)).color(Color32::from_rgb(249, 171, 0)));
+                                        });
+                                    });
+                            });
+                        } else {
+                            ui.add_space(16.0);
+                            ui.label(RichText::new("Click any element in the DOM tree above to inspect its attributes, computed CSS, and live box model diagram.").weak().italics());
+                            ui.add_space(16.0);
+                        }
+                    });
             }
             DevToolsTab::Styles => {
-                ScrollArea::vertical().show(ui, |ui| {
-                    for (i, rule) in tab.stylesheet.rules.iter().take(40).enumerate() {
-                        let selectors_str = rule
-                            .selectors
-                            .iter()
-                            .map(|s| format!("{:?}", s))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        ui.label(RichText::new(format!("[{}] {}", i + 1, selectors_str)).strong().color(Color32::from_rgb(138, 180, 248)));
-                        for decl in &rule.declarations {
-                            ui.label(format!("   {}: {:?}", decl.name, decl.value));
-                        }
-                        ui.add_space(4.0);
-                    }
-                });
+                Frame::NONE
+                    .fill(Color32::from_rgb(22, 24, 27))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🎨 CSS Rules & Specificity").strong().size(13.0).color(Color32::from_rgb(232, 234, 237)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(format!("Total: {} rules", tab.stylesheet.rules.len())).weak().size(11.0));
+                            });
+                        });
+                        ui.separator();
+                        ScrollArea::vertical().show(ui, |ui| {
+                            for (i, rule) in tab.stylesheet.rules.iter().take(40).enumerate() {
+                                let selectors_str = rule
+                                    .selectors
+                                    .iter()
+                                    .map(|s| format!("{:?}", s))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                ui.label(RichText::new(format!("[{}] {}", i + 1, selectors_str)).strong().color(Color32::from_rgb(138, 180, 248)));
+                                for decl in &rule.declarations {
+                                    ui.label(format!("   {}: {:?}", decl.name, decl.value));
+                                }
+                                ui.add_space(4.0);
+                            }
+                        });
+                    });
             }
             DevToolsTab::Source => {
-                ScrollArea::both().show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut tab.raw_html.clone())
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY),
-                    );
-                });
+                Frame::NONE
+                    .fill(Color32::from_rgb(22, 24, 27))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("📄 Raw HTML Source").strong().size(13.0).color(Color32::from_rgb(232, 234, 237)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(format!("{} bytes", tab.raw_html.len())).weak().size(11.0));
+                            });
+                        });
+                        ui.separator();
+                        ScrollArea::both().show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut tab.raw_html.clone())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    });
             }
             DevToolsTab::Network => {
-                ui.label(format!("Active URL: {}", tab.url));
-                ui.label(format!("Document Size: {} bytes", tab.raw_html.len()));
-                ui.label(format!("CSS Rules Loaded: {}", tab.stylesheet.rules.len()));
-                ui.label(format!("Render Height: {:.1} px", tab.page_height));
-                ui.label("TLS Implementation: Rustls (Pure Rust)");
-                ui.label("Engine: IronSurf 100% Pure Rust (No Chromium/Blink)");
+                Frame::NONE
+                    .fill(Color32::from_rgb(22, 24, 27))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 52, 58)))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("🌐 Connection & Engine Diagnostics").strong().size(13.0).color(Color32::WHITE));
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        egui::Grid::new("diag_grid").striped(true).spacing([12.0, 8.0]).show(ui, |ui| {
+                            ui.label(RichText::new("Active URL:").strong());
+                            ui.label(&tab.url);
+                            ui.end_row();
+
+                            ui.label(RichText::new("Document Size:").strong());
+                            ui.label(format!("{} bytes", tab.raw_html.len()));
+                            ui.end_row();
+
+                            ui.label(RichText::new("CSS Rules:").strong());
+                            ui.label(format!("{} parsed rules", tab.stylesheet.rules.len()));
+                            ui.end_row();
+
+                            ui.label(RichText::new("Render Height:").strong());
+                            ui.label(format!("{:.1} px", tab.page_height));
+                            ui.end_row();
+
+                            ui.label(RichText::new("TLS Engine:").strong());
+                            ui.label("Rustls (Pure Rust Crypto)");
+                            ui.end_row();
+
+                            ui.label(RichText::new("Browser Engine:").strong());
+                            ui.label("Aether 100% Pure Rust (Zero Chromium)");
+                            ui.end_row();
+                        });
+                    });
             }
         }
     }
+}
+
+fn render_box_model_diagram(ui: &mut egui::Ui, margin: &str, padding: &str, display: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width() - 8.0, 110.0), egui::Sense::hover());
+    let painter = ui.painter();
+
+    // 1. Margin (outer, orange #f9ab00)
+    let margin_rect = rect;
+    painter.rect_filled(margin_rect, 4.0, Color32::from_rgb(45, 38, 25));
+    painter.rect_stroke(margin_rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(249, 171, 0)), StrokeKind::Inside);
+    painter.text(Pos2::new(margin_rect.min.x + 6.0, margin_rect.min.y + 4.0), Align2::LEFT_TOP, format!("margin ({})", margin), FontId::proportional(10.0), Color32::from_rgb(249, 171, 0));
+
+    // 2. Border (middle, yellow #fdd663)
+    let border_rect = margin_rect.shrink(14.0);
+    painter.rect_filled(border_rect, 3.0, Color32::from_rgb(42, 40, 28));
+    painter.rect_stroke(border_rect, 3.0, Stroke::new(1.0_f32, Color32::from_rgb(253, 214, 99)), StrokeKind::Inside);
+    painter.text(Pos2::new(border_rect.min.x + 6.0, border_rect.min.y + 2.0), Align2::LEFT_TOP, "border: 1px", FontId::proportional(9.0), Color32::from_rgb(253, 214, 99));
+
+    // 3. Padding (green #81c995)
+    let padding_rect = border_rect.shrink(12.0);
+    painter.rect_filled(padding_rect, 2.0, Color32::from_rgb(26, 40, 32));
+    painter.rect_stroke(padding_rect, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(129, 201, 149)), StrokeKind::Inside);
+    painter.text(Pos2::new(padding_rect.min.x + 6.0, padding_rect.min.y + 2.0), Align2::LEFT_TOP, format!("padding ({})", padding), FontId::proportional(9.0), Color32::from_rgb(129, 201, 149));
+
+    // 4. Content (blue #8ab4f8)
+    let content_rect = padding_rect.shrink(10.0);
+    painter.rect_filled(content_rect, 2.0, Color32::from_rgb(30, 42, 60));
+    painter.rect_stroke(content_rect, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(138, 180, 248)), StrokeKind::Inside);
+    painter.text(content_rect.center(), Align2::CENTER_CENTER, display, FontId::proportional(11.0), Color32::from_rgb(138, 180, 248));
 }
 
 pub enum VectorIcon {
@@ -1224,7 +1825,8 @@ fn render_dom_node_ui(
     ui: &mut egui::Ui,
     node: &Node,
     depth: usize,
-    selected: &mut Option<String>,
+    selected: &Option<String>,
+    clicked_node: &mut Option<SelectedNodeInfo>,
 ) {
     if depth > 12 {
         return;
@@ -1241,33 +1843,79 @@ fn render_dom_node_ui(
             label.push('>');
 
             let is_sel = selected.as_ref() == Some(&label);
-            if node.children.is_empty() {
-                if ui.selectable_label(is_sel, format!("{} (empty)", label)).clicked() {
-                    *selected = Some(label);
+
+            let node_info = SelectedNodeInfo {
+                tag: data.tag_name.clone(),
+                id: data.attributes.get("id").cloned(),
+                class: data.attributes.get("class").cloned(),
+                attributes: data.attributes.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                text_preview: if !node.children.is_empty() {
+                    let txt = node.inner_text();
+                    let trimmed = txt.trim();
+                    if !trimmed.is_empty() {
+                        Some(if trimmed.len() > 40 { format!("{}...", &trimmed[..38]) } else { trimmed.to_string() })
+                    } else { None }
+                } else { None },
+                display: if matches!(data.tag_name.as_str(), "div" | "p" | "h1" | "h2" | "h3" | "ul" | "li" | "table") {
+                    "block".to_string()
+                } else if matches!(data.tag_name.as_str(), "button" | "input" | "img") {
+                    "inline-block".to_string()
+                } else {
+                    "inline".to_string()
+                },
+                font_size: match data.tag_name.as_str() {
+                    "h1" => "28px".to_string(),
+                    "h2" => "22px".to_string(),
+                    "h3" => "18px".to_string(),
+                    "small" => "12px".to_string(),
+                    _ => "16px".to_string(),
+                },
+                color: "#202124".to_string(),
+                bg_color: if data.tag_name == "button" { "#1a73e8".to_string() } else { "transparent".to_string() },
+                margin: match data.tag_name.as_str() {
+                    "h1" => "18px 0 12px 0".to_string(),
+                    "h2" => "16px 0 10px 0".to_string(),
+                    "p" => "10px 0".to_string(),
+                    _ => "0px".to_string(),
+                },
+                padding: if data.tag_name == "button" { "6px 14px".to_string() } else { "0px".to_string() },
+            };
+
+            ui.horizontal(|ui| {
+                ui.add_space((depth as f32) * 10.0);
+                let btn_text = RichText::new(&label).color(if is_sel {
+                    Color32::from_rgb(255, 200, 80)
+                } else {
+                    Color32::from_rgb(138, 180, 248)
+                });
+                if ui.selectable_label(is_sel, btn_text).clicked() {
+                    *clicked_node = Some(node_info);
                 }
-            } else {
-                egui::CollapsingHeader::new(RichText::new(label.clone()).color(Color32::from_rgb(138, 180, 248)))
-                    .default_open(depth < 2)
-                    .show(ui, |ui| {
-                        for child in &node.children {
-                            render_dom_node_ui(ui, child, depth + 1, selected);
-                        }
-                    });
+            });
+
+            for child in &node.children {
+                render_dom_node_ui(ui, child, depth + 1, selected, clicked_node);
             }
         }
         NodeType::Text(text) => {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                let preview = if trimmed.len() > 30 {
-                    format!("\"{}...\"", &trimmed[..30])
+                let preview = if trimmed.len() > 36 {
+                    format!("\"{}...\"", &trimmed[..34])
                 } else {
                     format!("\"{}\"", trimmed)
                 };
-                ui.label(RichText::new(format!("  {}", preview)).weak().italics());
+                ui.horizontal(|ui| {
+                    ui.add_space((depth as f32) * 10.0);
+                    ui.label(RichText::new(preview).weak().italics());
+                });
             }
         }
         NodeType::Comment(comment) => {
-            ui.label(RichText::new(format!("<!-- {} -->", comment.trim())).color(Color32::GRAY).italics());
+            ui.horizontal(|ui| {
+                ui.add_space((depth as f32) * 10.0);
+                ui.label(RichText::new(format!("<!-- {} -->", comment.trim())).color(Color32::GRAY).italics());
+            });
         }
     }
 }

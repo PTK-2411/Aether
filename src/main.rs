@@ -5,11 +5,11 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
     let font_files = [
+        ("liberation_sans", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
         ("noto_sans", "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
         ("dejavu_sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         ("noto_symbols", "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
         ("noto_symbols2", "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
-        ("liberation_sans", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
     ];
 
     let mut loaded_names = Vec::new();
@@ -47,12 +47,13 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size(Vec2::new(1280.0, 800.0))
             .with_min_inner_size(Vec2::new(800.0, 500.0))
-            .with_title("New Tab - Google Chrome"),
+            .with_title("Aether")
+            .with_decorations(false),
         ..Default::default()
     };
 
     eframe::run_native(
-        "IronSurf",
+        "Aether",
         native_options,
         Box::new(|cc| {
             setup_custom_fonts(&cc.egui_ctx);

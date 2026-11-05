@@ -72,9 +72,9 @@ pub fn normalize_url(input: &str) -> String {
         return format!("https://{}", trimmed);
     }
 
-    // Otherwise treat as search query on Google
+    // Otherwise treat as search query on Aether Search
     let encoded = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect::<String>();
-    format!("https://www.google.com/search?q={}", encoded)
+    format!("https://search.aether.local/?q={}", encoded)
 }
 
 pub fn resolve_relative_url(base_url: &str, href: &str) -> String {
@@ -102,6 +102,14 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
             url: "about:newtab".to_string(),
             html: WELCOME_HTML.to_string(),
             title: "New Tab".to_string(),
+        });
+    }
+
+    if url_str == "about:ai" || url_str.contains("gemini.google.com") {
+        return Ok(PageResponse {
+            url: "about:ai".to_string(),
+            html: AI_MODE_HTML.to_string(),
+            title: "Aether AI Mode".to_string(),
         });
     }
 
@@ -144,18 +152,20 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         }
     }
 
-    // Intercept Google Search to return real, rich, clean search results without anti-bot blocks
-    if url_str.starts_with("https://www.google.com/search")
+    // Intercept search queries to return real, rich, clean search results without anti-bot blocks
+    if url_str.starts_with("https://search.aether.local")
+        || url_str.starts_with("about:search")
+        || url_str.starts_with("https://www.google.com/search")
         || url_str.starts_with("https://google.com/search")
         || url_str.starts_with("http://www.google.com/search")
     {
         let query = extract_query_param(url_str, "q").unwrap_or_else(|| "Search".to_string());
-        return Ok(generate_google_search_results(&query, url_str));
+        return Ok(generate_aether_search_results(&query, url_str));
     }
 
     // HTTP / HTTPS fetching via reqwest
     let client = reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Aether/1.0")
         .timeout(std::time::Duration::from_secs(12))
         .build()
         .map_err(|e| e.to_string())?;
@@ -163,7 +173,7 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
     let response = client
         .get(url_str)
         .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header("Accept-Language", "vi,en-US;q=0.9,en;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9,vi;q=0.8")
         .send()
         .map_err(|e| e.to_string())?;
     let final_url = response.url().to_string();
@@ -171,9 +181,33 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
 
     let title = extract_title_or(&body, &final_url);
 
+    // If an external page is a JS-heavy SPA with near-empty static body, provide a helpful notice
+    let final_html = {
+        let text_chars = body.chars().filter(|c| c.is_alphanumeric()).count();
+        if text_chars < 180 && (body.contains("<noscript") || body.contains("id=\"root\"") || body.contains("id=\"app\"") || body.contains("<script")) {
+            let notice = r#"<div style="background-color:#2a2415; color:#fdd663; padding:12px 20px; font-family:sans-serif; font-size:13px; border-bottom:1px solid #7c5810; margin-bottom:16px;">
+                <strong>ℹ️ Notice:</strong> This website is an interactive Single Page Application (SPA) requiring a JavaScript engine. Aether's pure-Rust engine displays standard HTML5/CSS3. <a href="about:ai" style="color:#8ab4f8; font-weight:bold; margin-left:8px;">Open Aether AI Mode &rarr;</a>
+            </div>"#;
+            if let Some(pos) = body.to_ascii_lowercase().find("<body") {
+                if let Some(close_offset) = body[pos..].find('>') {
+                    let insert_pos = pos + close_offset + 1;
+                    let mut modified = body.clone();
+                    modified.insert_str(insert_pos, notice);
+                    modified
+                } else {
+                    format!("{}{}", notice, body)
+                }
+            } else {
+                format!("{}{}", notice, body)
+            }
+        } else {
+            body
+        }
+    };
+
     Ok(PageResponse {
         url: final_url,
-        html: body,
+        html: final_html,
         title,
     })
 }
@@ -183,7 +217,25 @@ fn extract_title_or(html: &str, default_title: &str) -> String {
     if let Some(start) = lower.find("<title>") {
         if let Some(end) = lower[start..].find("</title>") {
             let title_content = &html[start + 7..start + end];
-            let trimmed = title_content.trim();
+            let cleaned: String = title_content
+                .chars()
+                .filter(|c| {
+                    !c.is_control()
+                        && !matches!(
+                            *c,
+                            '\u{200B}'
+                                | '\u{200C}'
+                                | '\u{200D}'
+                                | '\u{200E}'
+                                | '\u{200F}'
+                                | '\u{202A}'..='\u{202E}'
+                                | '\u{2060}'..='\u{206F}'
+                                | '\u{FEFF}'
+                                | '\u{00AD}'
+                        )
+                })
+                .collect();
+            let trimmed = cleaned.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();
             }
@@ -203,45 +255,84 @@ fn extract_query_param(url_str: &str, param: &str) -> Option<String> {
     None
 }
 
-fn generate_google_search_results(query: &str, url_str: &str) -> PageResponse {
+fn generate_aether_search_results(query: &str, url_str: &str) -> PageResponse {
     let encoded_query = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
     let api_url = format!(
-        "https://vi.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&format=json&utf8=1",
+        "https://vi.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch={}&gsrlimit=8&prop=pageimages|extracts&piprop=thumbnail&pithumbsize=240&exintro=1&explaintext=1&exsentences=2&format=json&utf8=1",
         encoded_query
     );
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("IronSurf/1.0 (Mozilla/5.0)")
+        .user_agent("Aether/1.0 (Mozilla/5.0; Pure Rust)")
         .timeout(std::time::Duration::from_secs(4))
         .build();
 
     let mut results_html = String::new();
     let mut count = 0;
 
-    if let Ok(c) = client {
+    if let Ok(ref c) = client {
         if let Ok(resp) = c.get(&api_url).send() {
             if let Ok(json_text) = resp.text() {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_text) {
-                    if let Some(search_items) = val["query"]["search"].as_array() {
-                        for item in search_items.iter().take(8) {
-                            if let (Some(title), Some(snippet)) = (item["title"].as_str(), item["snippet"].as_str()) {
+                    if let Some(pages) = val["query"]["pages"].as_object() {
+                        for (_page_id, page) in pages.iter() {
+                            if let (Some(title), Some(extract)) = (page["title"].as_str(), page["extract"].as_str()) {
                                 count += 1;
-                                let clean_snippet = snippet
-                                    .replace("<span class=\"searchmatch\">", "")
-                                    .replace("</span>", "")
-                                    .replace("&quot;", "\"")
-                                    .replace("&amp;", "&");
                                 let page_title_encoded = url::form_urlencoded::byte_serialize(title.as_bytes()).collect::<String>();
                                 let page_url = format!("https://vi.wikipedia.org/wiki/{}", page_title_encoded);
-
+                                let thumb_html = if let Some(thumb_src) = page["thumbnail"]["source"].as_str() {
+                                    format!(r#"<div style="margin-top: 6px; margin-bottom: 8px;"><img src="{}" width="160" height="110" alt="{}"></div>"#, thumb_src, title)
+                                } else {
+                                    String::new()
+                                };
                                 results_html.push_str(&format!(
                                     r#"<div class="card">
                                         <div class="cite">https://vi.wikipedia.org › wiki › {}</div>
                                         <h3><a href="{}">{}</a></h3>
-                                        <p class="desc">{}...</p>
+                                        {}
+                                        <p class="desc">{}</p>
                                     </div>"#,
-                                    title, page_url, title, clean_snippet
+                                    title, page_url, title, thumb_html, extract
                                 ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback search API if generator returned nothing
+    if results_html.is_empty() {
+        let fallback_url = format!(
+            "https://vi.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&format=json&utf8=1",
+            encoded_query
+        );
+        if let Ok(ref c) = client {
+            if let Ok(resp) = c.get(&fallback_url).send() {
+                if let Ok(json_text) = resp.text() {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_text) {
+                        if let Some(search_items) = val["query"]["search"].as_array() {
+                            for item in search_items.iter().take(8) {
+                                if let (Some(title), Some(snippet)) = (item["title"].as_str(), item["snippet"].as_str()) {
+                                    count += 1;
+                                    let clean_snippet = snippet
+                                        .replace("<span class=\"searchmatch\">", "")
+                                        .replace("</span>", "")
+                                        .replace("&quot;", "\"")
+                                        .replace("&amp;", "&");
+                                    let page_title_encoded = url::form_urlencoded::byte_serialize(title.as_bytes()).collect::<String>();
+                                    let page_url = format!("https://vi.wikipedia.org/wiki/{}", page_title_encoded);
+
+                                    results_html.push_str(&format!(
+                                        r#"<div class="card">
+                                            <div class="cite">https://vi.wikipedia.org › wiki › {}</div>
+                                            <h3><a href="{}">{}</a></h3>
+                                            <p class="desc">{}...</p>
+                                        </div>"#,
+                                        title, page_url, title, clean_snippet
+                                    ));
+                                }
                             }
                         }
                     }
@@ -254,78 +345,51 @@ fn generate_google_search_results(query: &str, url_str: &str) -> PageResponse {
         results_html = format!(
             r#"<div class="card">
                 <div class="cite">https://duckduckgo.com › search › {}</div>
-                <h3><a href="https://html.duckduckgo.com/html/?q={}">Tìm kiếm: {} trên DuckDuckGo</a></h3>
-                <p class="desc">Khám phá các kết quả tìm kiếm tự do về "{}" không bị giới hạn hoặc chặn bới bot challenge.</p>
+                <h3><a href="https://html.duckduckgo.com/html/?q={}">Search: {} on DuckDuckGo</a></h3>
+                <p class="desc">Explore open search results for "{}" without third-party bot challenges.</p>
             </div>
             <div class="card">
-                <div class="cite">https://vi.wikipedia.org › wiki › {}</div>
-                <h3><a href="https://vi.wikipedia.org/wiki/Special:Search?search={}">Xem kết quả Bách khoa toàn thư Wikipedia cho "{}"</a></h3>
-                <p class="desc">Tra cứu bài viết, tài liệu và định nghĩa chi tiết trong cơ sở tri thức mở Wikipedia tiếng Việt.</p>
+                <div class="cite">https://en.wikipedia.org › wiki › {}</div>
+                <h3><a href="https://en.wikipedia.org/wiki/Special:Search?search={}">View Wikipedia Encyclopedia results for "{}"</a></h3>
+                <p class="desc">Look up articles, research, and technical definitions in Wikipedia.</p>
             </div>"#,
             query, encoded_query, query, query, query, encoded_query, query
         );
         count = 2;
     }
 
-    let stats_text = format!("Khoảng {} kết quả (0,18 giây)", (count * 12450) + 128);
+    let stats_text = format!("About {} results (0.12 seconds)", (count * 12450) + 128);
 
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
-    <title>{} - Google Tìm kiếm</title>
+    <title>{} - Aether Search</title>
     <style>
         body {{
             font-family: sans-serif;
             margin: 0;
-            padding: 0;
+            padding: 16px 28px;
             background-color: #202124;
             color: #bdc1c6;
         }}
-        .header {{
-            background-color: #303134;
-            padding: 16px 24px;
-            border-bottom: 1px solid #3c4043;
-        }}
-        .logo {{
-            color: #8ab4f8;
-            font-size: 24px;
-            font-weight: bold;
-            margin-right: 20px;
-            display: inline;
-        }}
-        .search-box {{
-            display: inline-block;
-            background-color: #202124;
-            border: 1px solid #5f6368;
-            border-radius: 20px;
-            padding: 6px 16px;
-            width: 480px;
-        }}
-        .tabs {{
-            margin-top: 14px;
-            padding-left: 10px;
-        }}
-        .tab {{
-            display: inline-block;
-            margin-right: 20px;
-            color: #9aa0a6;
-            font-size: 13px;
-        }}
-        .tab-active {{
-            color: #8ab4f8;
-            border-bottom: 2px solid #8ab4f8;
-            padding-bottom: 6px;
-            font-weight: bold;
-        }}
         .content {{
             max-width: 800px;
-            padding: 18px 24px;
+        }}
+        .brand-bar {{
+            padding: 8px 0 16px 0;
+            display: flex;
+            align-items: center;
+        }}
+        .brand-logo {{
+            color: #8ab4f8;
+            font-size: 20px;
+            font-weight: bold;
         }}
         .stats {{
             color: #9aa0a6;
             font-size: 13px;
-            margin-bottom: 20px;
+            margin-bottom: 18px;
         }}
         .card {{
             margin-bottom: 26px;
@@ -367,47 +431,173 @@ fn generate_google_search_results(query: &str, url_str: &str) -> PageResponse {
     </style>
 </head>
 <body>
-    <div class="header">
-        <span class="logo">Google</span>
-        <div class="search-box">
-            <span style="color: #fff; font-size: 15px;">{}</span>
-        </div>
-        <div class="tabs">
-            <span class="tab tab-active">Tất cả</span>
-            <span class="tab">Hình ảnh</span>
-            <span class="tab">Tin tức</span>
-            <span class="tab">Video</span>
-            <span class="tab">Bản đồ</span>
-        </div>
-    </div>
-
     <div class="content">
+        <div class="brand-bar">
+            <span class="brand-logo">✦ Aether Search</span>
+        </div>
         <div class="stats">{}</div>
 
         <div class="knowledge">
-            <h2>Kết quả tìm kiếm cho "{}"</h2>
-            <p class="desc">Trang kết quả được động cơ tìm kiếm IronSurf tổng hợp tự động, kết nối trực tiếp với bách khoa toàn thư mở và các nguồn tài nguyên trực tuyến.</p>
+            <h2>Search results for "{}"</h2>
+            <p class="desc">Results synthesized by Aether Search Engine, connecting to open encyclopedias and web resources.</p>
         </div>
 
         {}
     </div>
 </body>
 </html>"#,
-        query, query, stats_text, query, results_html
+        query, stats_text, query, results_html
     );
 
     PageResponse {
         url: url_str.to_string(),
         html,
-        title: format!("{} - Google Tìm kiếm", query),
+        title: format!("{} - Aether Search", query),
     }
 }
+
+pub const AI_MODE_HTML: &str = r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Aether AI Mode</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 0;
+            padding: 24px 32px;
+            background-color: #202124;
+            color: #bdc1c6;
+        }
+        .container {
+            max-width: 820px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            padding: 24px 0;
+        }
+        .sparkle {
+            font-size: 32px;
+            color: #8ab4f8;
+            margin-bottom: 8px;
+        }
+        h1 {
+            color: #ffffff;
+            font-size: 34px;
+            margin: 0 0 8px 0;
+        }
+        .subtitle {
+            color: #9aa0a6;
+            font-size: 15px;
+            margin: 0 0 24px 0;
+        }
+        .card {
+            background-color: #303134;
+            border: 1px solid #3c4043;
+            border-radius: 12px;
+            padding: 20px 24px;
+            margin-bottom: 20px;
+        }
+        .card h2 {
+            color: #8ab4f8;
+            font-size: 20px;
+            margin-top: 0;
+            margin-bottom: 8px;
+        }
+        .card p {
+            font-size: 14px;
+            line-height: 1.6;
+            color: #e8eaed;
+            margin: 0 0 12px 0;
+        }
+        .code-box {
+            background-color: #202124;
+            border: 1px solid #444746;
+            border-radius: 6px;
+            padding: 12px;
+            font-family: monospace;
+            font-size: 13px;
+            color: #a8c7fa;
+            margin-bottom: 14px;
+        }
+        .pills {
+            margin-top: 12px;
+        }
+        .pill {
+            display: inline-block;
+            background-color: #3c4043;
+            color: #8ab4f8;
+            padding: 6px 14px;
+            border-radius: 14px;
+            text-decoration: none;
+            font-size: 12px;
+            font-weight: bold;
+            margin-right: 8px;
+            margin-bottom: 8px;
+            border: 1px solid #5f6368;
+        }
+        .footer-nav {
+            text-align: center;
+            margin-top: 32px;
+            color: #9aa0a6;
+            font-size: 13px;
+        }
+        .footer-nav a {
+            color: #8ab4f8;
+            text-decoration: none;
+            margin: 0 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="sparkle">✦</div>
+            <h1>Aether AI Assistant</h1>
+            <p class="subtitle">Autonomous Intelligence & Knowledge Engine • Pure Rust Web Architecture</p>
+        </div>
+
+        <div class="card">
+            <h2>🦀 Pure Rust Engine Architecture</h2>
+            <p>Aether is designed from the ground up without Chromium, WebKit, or Blink. Every component from network fetch to visual rendering is compiled with Rust's strict memory safety and fearless concurrency.</p>
+            <div class="code-box">HTTP/S (Rustls) ➔ HTML Tokenizer ➔ CSS Specificity Cascade ➔ Box Model (Flow) ➔ Painter</div>
+            <div class="pills">
+                <a href="about:credits" class="pill">View Architecture Specification</a>
+                <a href="about:test" class="pill">Run CSS Layout Test Suite</a>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>⚡ Instant Encyclopedia & Web Research</h2>
+            <p>Search any query or topic from the Omnibox. Results connect directly to open encyclopedia resources and synthesized Wikipedia articles without tracking.</p>
+            <div class="pills">
+                <a href="https://search.aether.local/?q=Rust+programming+language" class="pill">Research: Rust Programming Language</a>
+                <a href="https://search.aether.local/?q=Quantum+computing" class="pill">Research: Quantum Computing</a>
+                <a href="https://search.aether.local/?q=Compiler+design" class="pill">Research: Compiler Design</a>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🛡️ Zero Tracking & Privacy Focused</h2>
+            <p>No telemetry, no background service workers, and no proprietary ad networks. Your browsing session remains strictly between your device and the destination server.</p>
+        </div>
+
+        <div class="footer-nav">
+            <a href="about:newtab">&larr; Return to New Tab</a> &bull;
+            <a href="about:credits">System Diagnostics</a> &bull;
+            <a href="about:test">CSS Test Suite</a>
+        </div>
+    </div>
+</body>
+</html>
+"#;
 
 pub const WELCOME_HTML: &str = r#"
 <!DOCTYPE html>
 <html>
 <head>
-    <title>IronSurf - 100% Pure Rust Web Browser</title>
+    <title>Aether - 100% Pure Rust Web Browser</title>
     <style>
         body {
             font-family: sans-serif;
@@ -504,40 +694,40 @@ pub const WELCOME_HTML: &str = r#"
         <span class="badge badge-rust">Pure Rust Engine</span>
         <span class="badge">Zero Chromium</span>
         <span class="badge">Fast & Memory Safe</span>
-        <h1>Welcome to IronSurf</h1>
-        <p class="tagline">Trình duyệt web độc lập được lập trình 100% bằng Rust từ con số 0.</p>
-        <p>IronSurf chứa toàn bộ chu trình xử lý web chuẩn: từ Network fetching, HTML parser, CSS style cascading, Box Model Layout engine cho đến Render pipeline và DevTools Inspector tích hợp.</p>
+        <h1>Welcome to Aether</h1>
+        <p class="tagline">An independent, lightweight web browser built 100% in Rust from scratch.</p>
+        <p>Aether features a complete standard browser pipeline: from secure HTTP/S network fetching, HTML tokenizer and DOM tree generator, to CSS cascade with specificity calculation, Box Model layout engine, and built-in interactive DevTools.</p>
         <div>
-            <a href="about:test" class="btn">Chạy CSS Test Suite</a>
-            <a href="about:credits" class="btn btn-outline">Kiến trúc Engine</a>
-            <a href="https://example.com" class="btn btn-outline">Tải example.com</a>
+            <a href="about:test" class="btn">Run CSS Test Suite</a>
+            <a href="about:credits" class="btn btn-outline">Engine Architecture</a>
+            <a href="about:ai" class="btn btn-outline">Aether AI Mode</a>
         </div>
     </div>
 
     <div class="grid">
         <div class="card">
-            <h2>Kiến Trúc Độc Lập Không Chromium</h2>
+            <h2>Zero-Chromium Independent Architecture</h2>
             <ul>
-                <li><strong>HTML Tokenizer & DOM Parser:</strong> Tự sinh cây DOM hoàn chỉnh từ mã HTML gốc.</li>
-                <li><strong>CSS Parser & Specificity:</strong> Khớp bộ chọn class, id, tag, combinators và tính toán độ ưu tiên specificity.</li>
-                <li><strong>CSS Box Model:</strong> Tính toán Margin, Border, Padding, Width, Height và ngắt dòng (word-wrapping).</li>
-                <li><strong>DevTools Inspector (F12):</strong> Tích hợp trình soi cây DOM, Computed Styles và mô hình hộp Box Model trực tiếp.</li>
+                <li><strong>HTML Tokenizer & DOM:</strong> Parses standard HTML tags, attributes, void elements, and constructs the DOM tree.</li>
+                <li><strong>CSS Cascade & Specificity:</strong> Evaluates selectors (class, id, tag, combinators) and calculates W3C specificity scores.</li>
+                <li><strong>CSS Box Model:</strong> Resolves Margin, Border, Padding, Width, Height, and word-wrapping layout flow.</li>
+                <li><strong>DevTools Inspector (F12):</strong> Live inspection of DOM hierarchy, computed styles, and interactive Box Model diagrams.</li>
             </ul>
         </div>
 
         <div class="card">
-            <h2>Thử Nghiệm Điều Hướng</h2>
-            <p>Bạn có thể nhập địa chỉ web vào thanh Address Bar phía trên (như <code>https://example.com</code> hoặc <code>about:test</code>) và nhấn Enter hoặc nhấn vào các liên kết bên dưới:</p>
+            <h2>Explore Navigation</h2>
+            <p>You can type any web URL in the Omnibox above (e.g. <code>https://example.com</code> or <code>about:test</code>) and press Enter, or click the links below:</p>
             <ul>
-                <li><a href="about:test">Trang kiểm thử Layout CSS & Giao diện (about:test)</a></li>
-                <li><a href="about:credits">Thông tin chi tiết về Engine & Giấy phép (about:credits)</a></li>
-                <li><a href="https://example.com">Tải trang mẫu https://example.com</a></li>
+                <li><a href="about:test">CSS Layout & UI Test Suite (about:test)</a></li>
+                <li><a href="about:credits">Engine Architecture & Credits (about:credits)</a></li>
+                <li><a href="about:ai">Aether AI Mode (about:ai)</a></li>
             </ul>
         </div>
     </div>
 
     <div class="footer">
-        <p>IronSurf Browser Engine &bull; Hoàn toàn bằng Rust &bull; Không phụ thuộc Chromium hay Blink</p>
+        <p>Aether Browser Engine &bull; Pure Rust &bull; Independent from Chromium and Blink</p>
     </div>
 </body>
 </html>
@@ -547,7 +737,7 @@ pub const TEST_SUITE_HTML: &str = r#"
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CSS & Layout Test Suite - IronSurf</title>
+    <title>CSS & Layout Test Suite - Aether</title>
     <style>
         body {
             font-family: sans-serif;
@@ -640,42 +830,42 @@ pub const TEST_SUITE_HTML: &str = r#"
 </head>
 <body>
     <div class="container">
-        <h1>Kiểm Thử Khả Năng Hiển Thị CSS & Layout</h1>
-        <p>Trang này kiểm tra độ chính xác của bộ phân tích cú pháp CSS, bộ khớp Selector và thuật toán tính toán Box Model.</p>
+        <h1>CSS & Layout Verification Suite</h1>
+        <p>This page validates the accuracy of the CSS parser, selector matcher, and box model layout engine.</p>
 
         <div class="box-test">
             <h3>Box Model: Margin, Border, Padding</h3>
-            <p>Hộp này kiểm tra padding bên trong, viền border màu tím và lề margin bên ngoài. Bên trong có <span class="highlight">văn bản nổi bật highlight</span>.</p>
+            <p>This container tests inner padding, a purple solid border, and outer margin flow. Inside is <span class="highlight">highlighted inline text</span>.</p>
         </div>
 
-        <h2>Kiểm Thử Màu Sắc và Thẻ Khối</h2>
+        <h2>Color and Block Box Verification</h2>
         <div class="card-row">
             <div class="card-green">
-                <strong>Thẻ Màu Xanh Lá (Success Box):</strong> Thể hiện màu nền RGB, viền bo góc và chữ in đậm.
+                <strong>Green Card (Success Box):</strong> Validates RGB background fills, corner radius, and bold typography.
             </div>
             <div class="card-blue">
-                <strong>Thẻ Màu Xanh Dương (Info Box):</strong> Kiểm tra kế thừa màu chữ và độ rộng linh hoạt.
+                <strong>Blue Card (Info Box):</strong> Validates text color inheritance and fluid block width.
             </div>
             <div class="card-red">
-                <strong>Thẻ Màu Đỏ (Alert Box):</strong> Kiểm thử khả năng hiển thị cảnh báo với CSS phân cấp.
+                <strong>Red Card (Alert Box):</strong> Validates cascading border and background rules.
             </div>
         </div>
 
-        <h2>Trích Dẫn và Khối Mã Nguồn</h2>
+        <h2>Blockquote and Code Blocks</h2>
         <blockquote>
-            "Mục tiêu là xây dựng một trình duyệt web tối giản, nhanh, độc lập hoàn toàn bằng ngôn ngữ Rust mà không cần cỗ máy cồng kềnh Chromium."
+            "The mission is to build a modern, high-performance web browser completely from scratch in safe Rust with zero Chromium dependencies."
         </blockquote>
 
-        <p>Mẫu mã nguồn Rust bên dưới được định kiểu với thẻ <code>&lt;pre&gt;</code>:</p>
+        <p>The code block below is styled with a <code>&lt;pre&gt;</code> element:</p>
         <pre>fn main() {
     println!("Hello from Pure Rust Browser!");
-    let dom = HtmlParser::parse("&lt;h1&gt;IronSurf&lt;/h1&gt;");
+    let dom = HtmlParser::parse("&lt;h1&gt;Aether&lt;/h1&gt;");
     let layout = build_layout_tree(&dom);
 }</pre>
 
         <div class="nav-links">
-            <a href="about:welcome">&larr; Quay lại Trang Chủ</a>
-            <a href="about:credits">Xem Kiến Trúc Động Cơ &rarr;</a>
+            <a href="about:welcome">&larr; Return to Welcome</a>
+            <a href="about:credits">View Engine Architecture &rarr;</a>
         </div>
     </div>
 </body>
@@ -686,7 +876,7 @@ pub const CREDITS_HTML: &str = r#"
 <!DOCTYPE html>
 <html>
 <head>
-    <title>IronSurf Engine Architecture & Credits</title>
+    <title>Aether Engine Architecture & Credits</title>
     <style>
         body {
             font-family: sans-serif;
@@ -730,32 +920,32 @@ pub const CREDITS_HTML: &str = r#"
 </head>
 <body>
     <div class="wrapper">
-        <h1>Kiến Trúc Động Cơ Trình Duyệt IronSurf</h1>
-        <p>IronSurf là một minh chứng rằng hoàn toàn có thể xây dựng một trình duyệt web độc lập, nhanh gọn bằng Rust mà không phụ thuộc vào Chromium/WebKit/Blink.</p>
+        <h1>Aether Browser Engine Architecture</h1>
+        <p>Aether proves that a fast, clean, memory-safe web browser can be engineered purely in Rust without relying on heavy engines like Chromium, WebKit, or Blink.</p>
 
-        <h2>Quy Trình Hoạt Động (Rendering Pipeline):</h2>
+        <h2>Standard Browser Pipeline:</h2>
         <div class="pipeline">
             <div class="step">
-                <strong>1. Network Fetcher (network.rs):</strong> Tải dữ liệu HTTP/HTTPS qua kết nối an toàn TLS (Rustls), hỗ trợ giao thức nội bộ about: và file://.
+                <strong>1. Network Fetcher (network.rs):</strong> Loads HTTP/HTTPS resources over secure TLS (Rustls), and handles internal protocols like about: and file://.
             </div>
             <div class="step">
-                <strong>2. HTML Parser & DOM Builder (html_parser.rs):</strong> Tokenizer bóc tách các thẻ, thuộc tính và sinh cây đối tượng DOM Node.
+                <strong>2. HTML Parser & DOM Builder (html_parser.rs):</strong> Tokenizes HTML tags, attributes, void elements, and builds the DOM Node tree.
             </div>
             <div class="step">
-                <strong>3. CSS Parser & Cascading (css.rs, style.rs):</strong> Phân tích các bộ quy tắc CSS, tính toán Specificity và kế thừa thuộc tính (Inherited Styles).
+                <strong>3. CSS Parser & Cascading (css.rs, style.rs):</strong> Parses stylesheet rules, computes selector specificity, and resolves inherited styles.
             </div>
             <div class="step">
-                <strong>4. Box Model Layout Engine (layout.rs):</strong> Tính toán kích thước Margin, Border, Padding, Content, căn giữa (margin auto) và ngắt dòng (text wrap).
+                <strong>4. Box Model Layout Engine (layout.rs):</strong> Computes Margin, Border, Padding, Content dimensions, auto centering, and word-wrapping flow.
             </div>
             <div class="step">
-                <strong>5. Display List & Painter (render.rs):</strong> Chuyển cây bố cục thành danh sách lệnh vẽ đồ họa và thực hiện hit-testing cho liên kết siêu văn bản.
+                <strong>5. Display List & Painter (render.rs):</strong> Generates optimized display lists, renders images, and handles interactive link hit-testing.
             </div>
             <div class="step">
-                <strong>6. Interactive Shell & DevTools (app.rs):</strong> Cửa sổ đa tab, thanh địa chỉ thông minh, nút điều hướng lịch sử và bộ thanh tra DOM Inspector thời gian thực.
+                <strong>6. Interactive Shell & DevTools (app.rs):</strong> Multi-tab interface, custom borderless window controls, real-time search autocomplete, and F12 DevTools.
             </div>
         </div>
 
-        <p><a href="about:welcome">&larr; Trở về Trang Chủ</a></p>
+        <p><a href="about:welcome">&larr; Return to Welcome</a></p>
     </div>
 </body>
 </html>
