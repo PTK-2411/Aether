@@ -45,6 +45,16 @@ impl<'a> StyledNode<'a> {
             ) {
                 return Display::None;
             }
+            // Hidden form controls carry data only; Chrome gives them no box at
+            // all, so their name/value must never reach the layout or the paint.
+            if tag == "input"
+                && self
+                    .node
+                    .get_attribute("type")
+                    .is_some_and(|t| t.eq_ignore_ascii_case("hidden"))
+            {
+                return Display::None;
+            }
         }
 
         // HTML5 hidden attribute defaults to display: none unless overridden
@@ -215,6 +225,31 @@ fn is_default_block_element(tag: &str) -> bool {
     )
 }
 
+/// Resolves `font-size` against the parent's computed size in pixels.
+fn compute_font_size(values: &HashMap<String, Value>, parent_px: f32) -> f32 {
+    let px = match values.get("font-size") {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        Some(Value::Length(v, Unit::Pt)) => *v * 1.333,
+        Some(Value::Length(v, Unit::Em)) => *v * parent_px,
+        Some(Value::Length(v, Unit::Rem)) => *v * 16.0,
+        Some(Value::Length(v, Unit::Percent)) => parent_px * (*v / 100.0),
+        Some(Value::Keyword(k)) => match k.as_str() {
+            "xx-small" => 9.0,
+            "x-small" => 10.0,
+            "small" => 13.0,
+            "medium" => 16.0,
+            "large" => 18.0,
+            "x-large" => 24.0,
+            "xx-large" => 32.0,
+            "smaller" => parent_px * 0.85,
+            "larger" => parent_px * 1.2,
+            _ => return parent_px,
+        },
+        _ => return parent_px,
+    };
+    px.clamp(1.0, 512.0)
+}
+
 fn is_inheritable(property: &str) -> bool {
     property.starts_with("--")
         || matches!(
@@ -316,6 +351,13 @@ fn build_styled_node<'a>(
             }
         }
     }
+
+    // Resolve typography to absolute values here, the "computed values" phase of
+    // the cascade. Layout and paint read pixels only, so `em` and `%` sizes keep
+    // compounding against the real parent instead of collapsing to 16px.
+    let parent_font_size = parent_styled.map(|p| p.font_size(None)).unwrap_or(16.0);
+    let computed_font_size = compute_font_size(&specified_values, parent_font_size);
+    specified_values.insert("font-size".to_string(), Value::Length(computed_font_size, Unit::Px));
 
     let link_url = if node.tag_name() == Some("a") {
         node.get_attribute("href").map(|s| s.to_string())

@@ -285,12 +285,13 @@ fn test_network_manager_search_fetch() {
     use std::time::{Duration, Instant};
 
     let net = NetworkManager::new();
-    // Fetch a raw search query (which should be normalized to Google Search and intercepted)
+    // A raw query becomes a real Google search; if Google answers with a
+    // script-only shell the query is replayed against a live engine.
     net.fetch(42, "rust programming language");
 
     let start = Instant::now();
     let mut received = None;
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(20) {
         if let Some(msg) = net.try_recv() {
             received = Some(msg);
             break;
@@ -303,9 +304,90 @@ fn test_network_manager_search_fetch() {
         NetworkMessage::PageLoaded { tab_id, result } => {
             assert_eq!(tab_id, 42);
             let page = result.expect("Search page fetch should succeed");
-            assert!(page.url.starts_with("https://www.google.com/search?q="));
-            assert!(page.title.contains("Google Search"));
-            assert!(page.html.contains("Google Search"));
+            assert!(
+                !page.html.contains("Aether Search Results"),
+                "results must come from a live engine, never from a locally composed page"
+            );
+            if page.html.contains("No results for") {
+                // Remote engines throttle bursts from a single address, so this
+                // run may legitimately find none of them answering. The promise
+                // still holds: name the failure instead of dressing up a page.
+                assert!(
+                    page.url.starts_with("https://www.google.com/search?q="),
+                    "the honest no-results page keeps the real search url, got {}",
+                    page.url
+                );
+                assert!(page.html.contains("needs JavaScript"));
+                return;
+            }
+            assert!(
+                page.url.starts_with("https://www.google.com/search?q=")
+                    || page.url.contains("bing.com/search")
+                    || page.url.contains("duckduckgo.com")
+                    || page.url.contains("brave.com/search")
+                    || page.url.contains("mojeek.com/search")
+                    || page.url.contains("ecosia.org/search"),
+                "search must go to a live engine, got {}",
+                page.url
+            );
+            assert!(
+                rust_browser::network::organic_result_links(&page.html) >= 3,
+                "a search page with no organic links is an empty shell, not a result list"
+            );
+            assert!(page.html.len() > 5_000, "live results page should carry real content");
         }
     }
+}
+
+#[test]
+fn embedded_json_shows_real_watch_page_data_without_javascript() {
+    // Braces inside string values must not confuse the object scanner.
+    let html = r#"<html><head><title>wrapper</title></head><body><script>
+        var ytInitialPlayerResponse = {"videoDetails":{"title":"Rust in 12 minutes {intro}",
+        "author":"Fireship & others","viewCount":"1234567","lengthSeconds":"820",
+        "channelId":"UCsBjURrPoezykLs9EqgamOA","shortDescription":"line one\nline two"}};
+        </script></body></html>"#;
+    let page = rust_browser::network::embedded_json_content_html(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        html,
+    )
+    .expect("a watch page with embedded data must render its real metadata");
+    assert!(page.contains("Rust in 12 minutes {intro}"));
+    assert!(page.contains("Fireship &amp; others"));
+    assert!(page.contains("1234567 views"));
+    assert!(page.contains("youtube.com/channel/UCsBjURrPoezykLs9EqgamOA"));
+    assert!(page.contains("line two"));
+}
+
+#[test]
+fn embedded_json_lists_real_videos_from_a_search_page() {
+    let html = r#"<html><body><script>var ytInitialData = {"contents":
+        {"sectionListRenderer":{"contents":[{"itemSectionRenderer":{"contents":[
+        {"videoRenderer":{"videoId":"abc123","title":{"runs":[{"text":"Learn <Rust>"}]},
+        "ownerText":{"runs":[{"text":"freeCodeCamp"}]},"publishedTimeText":{"simpleText":"3y ago"}}}
+        ]}}]}}}};
+        </script></body></html>"#;
+    let page = rust_browser::network::embedded_json_content_html(
+        "https://www.youtube.com/results?search_query=rust",
+        html,
+    )
+    .expect("search pages carry their results in the first response");
+    assert!(page.contains("watch?v=abc123"));
+    assert!(page.contains("Learn &lt;Rust&gt;"));
+    assert!(page.contains("rust - YouTube search results"));
+}
+
+#[test]
+fn embedded_json_only_applies_where_the_blob_exists() {
+    let empty_youtube = "<html><body><div>Try searching to get started</div></body></html>";
+    assert!(
+        rust_browser::network::embedded_json_content_html("https://www.youtube.com/", empty_youtube)
+            .is_none(),
+        "a page with no embedded payload falls back to the plain notice"
+    );
+    assert!(
+        rust_browser::network::embedded_json_content_html("https://example.com/", empty_youtube)
+            .is_none(),
+        "only YouTube is read this way"
+    );
 }

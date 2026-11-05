@@ -14,20 +14,27 @@ use rust_browser::style::{get_matched_rules, get_specified_values, style_tree};
 
 #[test]
 fn test_empirical_bug_rem_shadowed_by_em() {
-    // In src/css.rs:529-532, `strip_suffix("em")` is evaluated before `strip_suffix("rem")`.
-    // Because any string ending in "rem" also ends in "em", stripping "em" from "2rem"
-    // leaves "2r", which fails float parsing. Consequently, parse_length returns None
-    // and parse_value_str degrades "2rem" to Value::Keyword("2rem") instead of Value::Length(2.0, Unit::Rem).
+    // Regression guard: `strip_suffix("em")` used to be evaluated before
+    // `strip_suffix("rem")`. Because any string ending in "rem" also ends in "em",
+    // stripping "em" from "2rem" left "2r", which failed float parsing, so
+    // parse_length returned None and "2rem" degraded to Value::Keyword("2rem") —
+    // silently dropping every rem-sized declaration on a page.
     let parsed_rem = parse_value_str("2rem");
     assert_eq!(
         parsed_rem,
-        Some(Value::Keyword("2rem".to_string())),
-        "Empirical Bug Confirmed: 2rem is wrongly parsed as a Keyword due to suffix ordering"
+        Some(Value::Length(2.0, Unit::Rem)),
+        "2rem must parse as a rem length, not degrade to a keyword"
     );
 
-    // Conversely, "2em" works properly:
+    // "2em" must keep working through the same chain.
     let parsed_em = parse_value_str("2em");
     assert_eq!(parsed_em, Some(Value::Length(2.0, Unit::Em)));
+
+    // Uppercase units take the same path.
+    assert_eq!(
+        parse_value_str("1.1REM"),
+        Some(Value::Length(1.1, Unit::Rem))
+    );
 }
 
 // =========================================================================

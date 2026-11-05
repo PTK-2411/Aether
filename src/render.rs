@@ -20,8 +20,9 @@ pub enum DisplayItem {
         text: String,
         color: Color32,
         size: f32,
-        #[allow(dead_code)]
         bold: bool,
+        italic: bool,
+        monospace: bool,
         #[allow(dead_code)]
         is_link: bool,
         #[allow(dead_code)]
@@ -50,10 +51,15 @@ pub enum DisplayItem {
 pub struct InteractiveLink {
     pub rect: Rect,
     pub href: String,
+    /// True when the link lives in a `position: fixed` subtree, so hit-testing
+    /// has to use the viewport-shifted origin instead of the document one.
+    pub fixed: bool,
 }
 
 pub struct DisplayList {
     pub items: Vec<DisplayItem>,
+    /// Painted in viewport coordinates: the document scroll doesn't move them.
+    pub fixed: Vec<DisplayItem>,
     pub links: Vec<InteractiveLink>,
 }
 
@@ -61,6 +67,7 @@ impl DisplayList {
     pub fn new() -> Self {
         DisplayList {
             items: Vec::new(),
+            fixed: Vec::new(),
             links: Vec::new(),
         }
     }
@@ -68,11 +75,48 @@ impl DisplayList {
 
 pub fn build_display_list(layout_root: &LayoutBox) -> DisplayList {
     let mut list = DisplayList::new();
-    render_layout_box(&mut list, layout_root);
+    render_box(&mut list, layout_root, false);
     list
 }
 
-fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
+fn is_fixed_box(layout_box: &LayoutBox) -> bool {
+    matches!(
+        layout_box.get_styled_node().and_then(|s| s.value("position")),
+        Some(Value::Keyword(k)) if k == "fixed"
+    )
+}
+
+/// Appends `layout_box` to `list`. A `position: fixed` subtree is diverted into
+/// `DisplayList::fixed` so the paint pass can pin it to the viewport while the
+/// rest of the document scrolls underneath it.
+fn render_box(list: &mut DisplayList, layout_box: &LayoutBox, in_fixed: bool) {
+    let mine = in_fixed || is_fixed_box(layout_box);
+    if mine && !in_fixed {
+        let mut pinned = DisplayList::new();
+        render_box_inner(&mut pinned, layout_box, true);
+        list.fixed.append(&mut pinned.items);
+        list.links.append(&mut pinned.links);
+        return;
+    }
+    render_box_inner(list, layout_box, mine);
+}
+
+/// Sites such as search engines hide the page with `opacity:0` plus a reveal
+/// animation that only becomes visible once the animation runs. Aether paints a
+/// single static frame, so the pre-animation state is the wrong one: a box
+/// carrying a named animation is drawn at the state its animation ends in.
+/// `visibility` keeps its strict rule because hidden-then-revealed-on-hover
+/// menus rely on it and have no timed end state to reach.
+fn reveal_animation_pending(styled_node: &crate::style::StyledNode) -> bool {
+    let named = |v: Option<&Value>| match v {
+        Some(Value::Keyword(k)) => k != "none",
+        Some(Value::StringLiteral(s)) => !s.trim().is_empty() && s.trim() != "none",
+        _ => false,
+    };
+    named(styled_node.value("animation-name")) || named(styled_node.value("animation"))
+}
+
+fn render_box_inner(list: &mut DisplayList, layout_box: &LayoutBox, in_fixed: bool) {
     if let Some(styled_node) = layout_box.get_styled_node() {
         if let Some(Value::Keyword(v)) = styled_node.value("visibility") {
             if v == "hidden" || v == "collapse" {
@@ -80,7 +124,7 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
             }
         }
         if let Some(Value::Number(op)) = styled_node.value("opacity") {
-            if *op <= 0.0 {
+            if op <= &0.0 && !reveal_animation_pending(styled_node) {
                 return;
             }
         }
@@ -99,6 +143,13 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
             let font_size = styled_node.font_size(None);
             let color = css_to_egui_color(styled_node.color(None));
             let bold = styled_node.is_bold(None);
+            let italic = styled_node.is_italic(None);
+            let family = match styled_node.value("font-family") {
+                Some(Value::Keyword(k)) => Some(k.as_str()),
+                Some(Value::StringLiteral(s)) => Some(s.as_str()),
+                _ => None,
+            };
+            let monospace = crate::text_metrics::is_monospace_family(family);
 
             let (is_link, href) = get_link_info(styled_node);
             let underline = is_link || styled_node.value("text-decoration").map_or(false, |v| match v {
@@ -121,6 +172,8 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
                 color: final_color,
                 size: font_size,
                 bold,
+                italic,
+                monospace,
                 is_link,
                 href: href.clone(),
                 underline,
@@ -130,6 +183,7 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
                 list.links.push(InteractiveLink {
                     rect,
                     href: target,
+                    fixed: in_fixed,
                 });
             }
         }
@@ -177,8 +231,57 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
         _ => {}
     }
 
-    for child in &layout_box.children {
-        render_layout_box(list, child);
+    let mut normal = Vec::new();
+    let mut below = Vec::new();
+    let mut above = Vec::new();
+    for (idx, child) in layout_box.children.iter().enumerate() {
+        match stacking_layer(child) {
+            Some((true, z)) => below.push((z, idx)),
+            Some((false, z)) => above.push((z, idx)),
+            None => normal.push((0, idx)),
+        }
+    }
+
+    if below.is_empty() && above.is_empty() {
+        for (_, idx) in normal {
+            render_box(list, &layout_box.children[idx], in_fixed);
+        }
+        return;
+    }
+
+    above.sort_by_key(|(z, idx)| (*z, *idx));
+    below.sort_by_key(|(z, idx)| (*z, *idx));
+
+    for (_, idx) in below {
+        render_box(list, &layout_box.children[idx], in_fixed);
+    }
+    for (_, idx) in normal {
+        render_box(list, &layout_box.children[idx], in_fixed);
+    }
+    for (_, idx) in above {
+        render_box(list, &layout_box.children[idx], in_fixed);
+    }
+}
+
+/// Paint layer of a positioned box: `None` stays in normal flow order,
+/// otherwise `(below_normal_flow, z_index)`.
+fn stacking_layer(layout_box: &LayoutBox) -> Option<(bool, i32)> {
+    let style = layout_box.get_styled_node()?;
+    let positioned = match style.value("position") {
+        Some(Value::Keyword(k)) => matches!(k.as_str(), "relative" | "absolute" | "fixed" | "sticky"),
+        _ => false,
+    };
+    if !positioned {
+        return None;
+    }
+    let z = match style.value("z-index") {
+        Some(Value::Number(n)) => *n as i32,
+        _ => 0,
+    };
+    if z < 0 {
+        Some((true, z))
+    } else {
+        Some((false, z))
     }
 }
 
@@ -241,27 +344,52 @@ pub fn css_to_egui_color(c: CssColor) -> Color32 {
 }
 
 /// Paints the entire display list onto egui::Painter with offset, zoom, and optional image textures.
+/// Paints the document at `offset` and the pinned `position: fixed` layer at
+/// `fixed_offset`, which is the viewport origin rather than the scrolled one.
 pub fn paint_display_list(
     painter: &egui::Painter,
     list: &DisplayList,
     offset: Vec2,
+    fixed_offset: Vec2,
     zoom: f32,
     textures: Option<&std::collections::HashMap<String, egui::TextureHandle>>,
 ) {
-    for item in &list.items {
+    paint_items(painter, &list.items, offset, zoom, textures);
+    paint_items(painter, &list.fixed, fixed_offset, zoom, textures);
+}
+
+fn paint_items(
+    painter: &egui::Painter,
+    items: &[DisplayItem],
+    offset: Vec2,
+    zoom: f32,
+    textures: Option<&std::collections::HashMap<String, egui::TextureHandle>>,
+) {
+    // A long article can hold tens of thousands of boxes; skipping what the
+    // viewport can't show keeps scrolling smooth. The margin keeps partially
+    // visible runs from flickering at the edges.
+    let clip = painter.clip_rect().expand(32.0);
+    let screen = |rect: Rect| {
+        egui::Rect::from_min_size(
+            Pos2::new(rect.x * zoom + offset.x, rect.y * zoom + offset.y),
+            Vec2::new(rect.width * zoom, rect.height * zoom),
+        )
+    };
+
+    for item in items {
         match item {
             DisplayItem::SolidColor { rect, color, corner_radius } => {
-                let screen_rect = egui::Rect::from_min_size(
-                    Pos2::new(rect.x * zoom + offset.x, rect.y * zoom + offset.y),
-                    Vec2::new(rect.width * zoom, rect.height * zoom),
-                );
+                let screen_rect = screen(*rect);
+                if !screen_rect.is_positive() || !screen_rect.intersects(clip) {
+                    continue;
+                }
                 painter.rect_filled(screen_rect, *corner_radius * zoom, *color);
             }
             DisplayItem::Border { rect, color, width, corner_radius } => {
-                let screen_rect = egui::Rect::from_min_size(
-                    Pos2::new(rect.x * zoom + offset.x, rect.y * zoom + offset.y),
-                    Vec2::new(rect.width * zoom, rect.height * zoom),
-                );
+                let screen_rect = screen(*rect);
+                if !screen_rect.is_positive() || !screen_rect.intersects(clip) {
+                    continue;
+                }
                 painter.rect_stroke(
                     screen_rect,
                     *corner_radius * zoom,
@@ -269,9 +397,25 @@ pub fn paint_display_list(
                     StrokeKind::Inside,
                 );
             }
-            DisplayItem::Text { pos, text, color, size, bold: _, is_link: _, href: _, underline } => {
+            DisplayItem::Text { pos, text, color, size, bold, italic, monospace, is_link: _, href: _, underline } => {
                 let screen_pos = Pos2::new(pos.x * zoom + offset.x, pos.y * zoom + offset.y);
-                let font_id = FontId::proportional(*size * zoom);
+                let run_box = egui::Rect::from_min_size(
+                    screen_pos,
+                    Vec2::new(
+                        text.chars().count() as f32 * size * 0.7 * zoom,
+                        size * 1.8 * zoom,
+                    ),
+                );
+                if !run_box.intersects(clip) {
+                    continue;
+                }
+                let face = match (*bold, *italic) {
+                    (true, true) => crate::text_metrics::Face::BoldItalic,
+                    (true, false) => crate::text_metrics::Face::Bold,
+                    (false, true) => crate::text_metrics::Face::Italic,
+                    (false, false) => crate::text_metrics::Face::Regular,
+                };
+                let font_id = crate::text_metrics::font_id(*size * zoom, face, *monospace);
 
                 let text_pos = Pos2::new(screen_pos.x, screen_pos.y);
                 painter.text(
@@ -291,10 +435,10 @@ pub fn paint_display_list(
                 }
             }
             DisplayItem::Image { rect, src, alt } => {
-                let screen_rect = egui::Rect::from_min_size(
-                    Pos2::new(rect.x * zoom + offset.x, rect.y * zoom + offset.y),
-                    Vec2::new(rect.width * zoom, rect.height * zoom),
-                );
+                let screen_rect = screen(*rect);
+                if !screen_rect.is_positive() || !screen_rect.intersects(clip) {
+                    continue;
+                }
 
                 let mut drawn = false;
                 if let Some(tex_map) = textures {
@@ -328,8 +472,8 @@ pub fn paint_display_list(
                     draw_image_placeholder_icon(painter, icon_center, icon_r, Color32::from_rgb(140, 146, 156));
 
                     if !alt.is_empty() && screen_rect.height() > 36.0 {
-                        let preview_alt = if alt.len() > 30 {
-                            format!("{}...", &alt[..28])
+                        let preview_alt: String = if alt.chars().count() > 30 {
+                            alt.chars().take(28).collect::<String>() + "..."
                         } else {
                             alt.clone()
                         };
@@ -344,10 +488,10 @@ pub fn paint_display_list(
                 }
             }
             DisplayItem::ButtonBox { rect, label, bg_color, text_color } => {
-                let screen_rect = egui::Rect::from_min_size(
-                    Pos2::new(rect.x * zoom + offset.x, rect.y * zoom + offset.y),
-                    Vec2::new(rect.width * zoom, rect.height * zoom),
-                );
+                let screen_rect = screen(*rect);
+                if !screen_rect.is_positive() || !screen_rect.intersects(clip) {
+                    continue;
+                }
                 painter.rect_filled(screen_rect, 4.0 * zoom, *bg_color);
                 painter.rect_stroke(screen_rect, 4.0 * zoom, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 200)), StrokeKind::Inside);
                 painter.text(
@@ -359,10 +503,10 @@ pub fn paint_display_list(
                 );
             }
             DisplayItem::InputBox { rect, text, placeholder } => {
-                let screen_rect = egui::Rect::from_min_size(
-                    Pos2::new(rect.x * zoom + offset.x, rect.y * zoom + offset.y),
-                    Vec2::new(rect.width * zoom, rect.height * zoom),
-                );
+                let screen_rect = screen(*rect);
+                if !screen_rect.is_positive() || !screen_rect.intersects(clip) {
+                    continue;
+                }
                 painter.rect_filled(screen_rect, 4.0 * zoom, Color32::WHITE);
                 painter.rect_stroke(screen_rect, 4.0 * zoom, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 200)), StrokeKind::Inside);
                 let display_str = if text.is_empty() { placeholder } else { text };

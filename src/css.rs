@@ -843,7 +843,9 @@ pub fn parse_value_str(s: &str) -> Option<Value> {
     }
 
     // Check string literal: "..." or '...'
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
         return Some(Value::StringLiteral(s[1..s.len() - 1].to_string()));
     }
 
@@ -855,10 +857,10 @@ fn parse_length(s: &str) -> Option<Value> {
     let s_lower = s.to_ascii_lowercase();
     let (num_str, unit) = if let Some(n) = s_lower.strip_suffix("px") {
         (n, Unit::Px)
-    } else if let Some(n) = s_lower.strip_suffix("em") {
-        (n, Unit::Em)
     } else if let Some(n) = s_lower.strip_suffix("rem") {
         (n, Unit::Rem)
+    } else if let Some(n) = s_lower.strip_suffix("em") {
+        (n, Unit::Em)
     } else if let Some(n) = s_lower.strip_suffix('%') {
         (n, Unit::Percent)
     } else if let Some(n) = s_lower.strip_suffix("pt") {
@@ -878,6 +880,11 @@ pub fn parse_color(s: &str) -> Option<CssColor> {
     let s = s.trim();
     if s.starts_with('#') {
         let hex = &s[1..];
+        // Non-hex bytes can still be multi-byte characters, and the fixed
+        // offsets below would cut one in half.
+        if !hex.is_ascii() {
+            return None;
+        }
         match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;

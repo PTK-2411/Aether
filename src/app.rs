@@ -189,7 +189,7 @@ impl Tab {
                     margin: EdgeSizes::default(),
                 };
                 layout_box.layout(containing_block);
-                self.page_height = layout_box.dimensions.margin_box().height;
+                self.page_height = crate::layout::content_height(&layout_box);
                 self.display_list = Some(build_display_list(&layout_box));
                 self.last_layout_width = width;
             }
@@ -254,6 +254,40 @@ pub struct BrowserApp {
     suggest_rx: std::sync::mpsc::Receiver<(String, Vec<String>)>,
     show_omnibox_suggestions: bool,
     show_center_suggestions: bool,
+    omnibox_focus_requested: bool,
+    pending_scroll: Option<ScrollIntent>,
+    closed_tab_stack: Vec<String>,
+}
+
+/// Page-scroll request raised by a keyboard shortcut and consumed by the page
+/// viewport, which is the only place that knows the viewport and page heights.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScrollIntent {
+    Lines(i32),
+    Pages(f32),
+    Top,
+    Bottom,
+}
+
+/// Standard Chrome keyboard shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChromeShortcut {
+    NewTab,
+    CloseTab,
+    ReopenClosedTab,
+    FocusOmnibox,
+    Reload,
+    NextTab,
+    PrevTab,
+    SelectTab(usize),
+    LastTab,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    Back,
+    Forward,
+    Escape,
+    Scroll(ScrollIntent),
 }
 
 impl BrowserApp {
@@ -335,6 +369,9 @@ impl BrowserApp {
             suggest_rx: sug_rx,
             show_omnibox_suggestions: false,
             show_center_suggestions: false,
+            omnibox_focus_requested: false,
+            pending_scroll: None,
+            closed_tab_stack: Vec::new(),
         };
 
         // Open initial New Tab
@@ -489,6 +526,88 @@ impl BrowserApp {
         }
     }
 
+    fn activate_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.active_tab_idx = idx;
+        if let Some(tab) = self.tabs.get(idx) {
+            self.address_input = if tab.is_new_tab() { String::new() } else { tab.url.clone() };
+        }
+        self.show_omnibox_suggestions = false;
+        self.search_suggestions.clear();
+    }
+
+    /// Applies Chrome's standard keyboard shortcuts to the browser shell.
+    fn handle_chrome_shortcuts(&mut self, ctx: &egui::Context) {
+        let typing_in_field = ctx.memory(|m| m.focused().is_some());
+        let Some(shortcut) = ctx.input(|i| detect_chrome_shortcut(i, typing_in_field)) else {
+            return;
+        };
+        match shortcut {
+            ChromeShortcut::NewTab => {
+                self.open_new_tab("about:newtab".to_string());
+                self.omnibox_focus_requested = true;
+            }
+            ChromeShortcut::CloseTab => {
+                let url = self.tabs.get(self.active_tab_idx).map(|t| t.url.clone());
+                if let Some(url) = url {
+                    if !url.contains("about:newtab") && !url.contains("about:welcome") {
+                        self.closed_tab_stack.push(url);
+                        self.closed_tab_stack =
+                            self.closed_tab_stack.split_off(self.closed_tab_stack.len().saturating_sub(10));
+                    }
+                }
+                self.close_tab(self.active_tab_idx);
+            }
+            ChromeShortcut::ReopenClosedTab => {
+                if let Some(url) = self.closed_tab_stack.pop() {
+                    self.open_new_tab(url);
+                }
+            }
+            ChromeShortcut::FocusOmnibox => {
+                self.omnibox_focus_requested = true;
+            }
+            ChromeShortcut::Reload => self.reload(),
+            ChromeShortcut::NextTab => {
+                let count = self.tabs.len();
+                if count > 1 {
+                    self.activate_tab((self.active_tab_idx + 1) % count);
+                }
+            }
+            ChromeShortcut::PrevTab => {
+                let count = self.tabs.len();
+                if count > 1 {
+                    self.activate_tab((self.active_tab_idx + count - 1) % count);
+                }
+            }
+            ChromeShortcut::SelectTab(idx) => self.activate_tab(idx),
+            ChromeShortcut::LastTab => {
+                let last = self.tabs.len().saturating_sub(1);
+                self.activate_tab(last);
+            }
+            ChromeShortcut::ZoomIn => self.zoom_in(),
+            ChromeShortcut::ZoomOut => self.zoom_out(),
+            ChromeShortcut::ZoomReset => self.zoom_reset(),
+            ChromeShortcut::Back => self.go_back(),
+            ChromeShortcut::Forward => self.go_forward(),
+            ChromeShortcut::Escape => {
+                if self.show_omnibox_suggestions {
+                    self.show_omnibox_suggestions = false;
+                    self.search_suggestions.clear();
+                } else if self.show_menu_popup {
+                    self.show_menu_popup = false;
+                }
+            }
+            ChromeShortcut::Scroll(intent) => {
+                if self.pending_scroll != Some(intent) {
+                    self.pending_scroll = Some(intent);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn check_network_responses(&mut self) {
         while let Some(msg) = self.network.try_recv() {
             match msg {
@@ -535,11 +654,7 @@ impl BrowserApp {
                                 });
 
                                 tab.url = res.url.clone();
-                                tab.title = if res.title.len() > 24 {
-                                    format!("{}...", &res.title[..24])
-                                } else {
-                                    res.title
-                                };
+                                tab.title = preview_chars(&res.title, 24);
                                 tab.raw_html = res.html;
 
                                 // Parse HTML to DOM
@@ -571,14 +686,11 @@ impl BrowserApp {
                                     timestamp: time_str,
                                     level: ConsoleLogLevel::Error,
                                     source: "Network".to_string(),
-                                    message: format!("Failed to load {}: {}", tab.url, err),
+                                    message: format!("{} — {} ({})", err.code, err.description, err.detail),
                                 });
 
-                                tab.title = "Error loading page".to_string();
-                                tab.raw_html = format!(
-                                    "<html><body style='padding: 32px; background-color: #202124; color: #fff; font-family: sans-serif;'><h1 style='color: #ea4335;'>Failed to Load Page</h1><p style='color: #9aa0a6;'>{}</p></body></html>",
-                                    err
-                                );
+                                tab.title = err.code.clone();
+                                tab.raw_html = chrome_error_page_html(&err);
                                 let dom = HtmlParser::parse(&tab.raw_html);
                                 tab.stylesheet = CssParser::parse(DEFAULT_USER_AGENT_CSS);
                                 tab.dom_root = Some(dom);
@@ -919,6 +1031,8 @@ impl eframe::App for BrowserApp {
         if toggle_devtools {
             self.show_devtools = !self.show_devtools;
         }
+
+        self.handle_chrome_shortcuts(ctx);
 
         let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let window_radius = if is_maximized { 0 } else { 10 };
@@ -1278,8 +1392,23 @@ impl BrowserApp {
                 egui::TextEdit::singleline(&mut self.address_input)
                     .hint_text("Search Google or type a URL")
                     .frame(false)
+                    .id_source("aether_omnibox")
                     .text_color(Color32::from_rgb(232, 234, 237)),
             );
+
+            if self.omnibox_focus_requested {
+                self.omnibox_focus_requested = false;
+                text_edit.request_focus();
+                // Chrome selects the whole URL so typing replaces it.
+                let chars = self.address_input.chars().count();
+                if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ctx, text_edit.id) {
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::default(),
+                        egui::text::CCursor::new(chars),
+                    )));
+                    state.store(ctx, text_edit.id);
+                }
+            }
 
             if text_edit.changed() {
                 self.show_omnibox_suggestions = true;
@@ -1514,6 +1643,10 @@ impl BrowserApp {
         };
 
         let target_width = (available_size.x / self.zoom_level).max(200.0);
+        crate::layout::set_viewport(
+            target_width,
+            (available_size.y / self.zoom_level).max(1.0),
+        );
         if (target_width - current_tab.last_layout_width).abs() > 10.0 {
             current_tab.recompute_layout(target_width);
         }
@@ -1522,20 +1655,32 @@ impl BrowserApp {
         let mut clicked_href = None;
         let mut new_hovered_link = None;
 
-        ScrollArea::vertical()
+        let scroll_delta = self.pending_scroll.take().map(|intent| {
+            let viewport_h = available_size.y.max(100.0);
+            let page_h = (page_height + viewport_h).max(viewport_h);
+            match intent {
+                ScrollIntent::Lines(n) => -(n as f32 * 40.0 * self.zoom_level),
+                ScrollIntent::Pages(f) => -(f * viewport_h),
+                ScrollIntent::Top => page_h,
+                ScrollIntent::Bottom => -page_h,
+            }
+        });
+
+        let scroll_output = ScrollArea::vertical()
             .drag_to_scroll(false)
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_viewport(ui, |ui, viewport| {
+                if let Some(delta) = scroll_delta {
+                    ui.scroll_with_delta(Vec2::new(0.0, delta));
+                }
+
                 let (response, painter) = ui.allocate_painter(
                     Vec2::new(available_size.x, page_height.max(available_size.y)),
                     egui::Sense::click(),
                 );
 
                 // Webpage canvas background
-                let canvas_bg = if current_tab.url.contains("search.aether.local")
-                    || current_tab.url.contains("google.com/search")
-                    || current_tab.url.contains("about:ai")
-                {
+                let canvas_bg = if current_tab.url.contains("about:ai") {
                     Color32::from_rgb(32, 33, 36)
                 } else if current_tab.url.contains("about:credits") {
                     Color32::from_rgb(15, 23, 42)
@@ -1565,15 +1710,26 @@ impl BrowserApp {
 
                 let origin = response.rect.min;
                 let offset = Vec2::new(origin.x, origin.y);
+                // Pinned boxes are laid out against the viewport, so they shift
+                // by the scroll position to stay where the user is looking.
+                let fixed_offset = offset + viewport.min.to_vec2();
 
                 if let Some(ref display_list) = current_tab.display_list {
-                    paint_display_list(&painter, display_list, offset, self.zoom_level, Some(&self.image_textures));
+                    paint_display_list(
+                        &painter,
+                        display_list,
+                        offset,
+                        fixed_offset,
+                        self.zoom_level,
+                        Some(&self.image_textures),
+                    );
 
                     if let Some(mouse_pos) = ctx.pointer_hover_pos() {
-                        let rel_x = (mouse_pos.x - offset.x) / self.zoom_level;
-                        let rel_y = (mouse_pos.y - offset.y) / self.zoom_level;
-
                         for link in &display_list.links {
+                            let link_offset = if link.fixed { fixed_offset } else { offset };
+                            let rel_x = (mouse_pos.x - link_offset.x) / self.zoom_level;
+                            let rel_y = (mouse_pos.y - link_offset.y) / self.zoom_level;
+
                             if link.rect.contains(rel_x, rel_y) {
                                 ctx.set_cursor_icon(CursorIcon::PointingHand);
                                 new_hovered_link = Some(link.href.clone());
@@ -1586,6 +1742,7 @@ impl BrowserApp {
                     }
                 }
             });
+        let _ = scroll_output;
 
         self.hovered_link = new_hovered_link;
 
@@ -2257,7 +2414,7 @@ impl BrowserApp {
                             }
 
                             // Render row contents
-                            let name_preview = if entry.name.len() > 18 { format!("{}...", &entry.name[..16]) } else { entry.name.clone() };
+                            let name_preview = preview_chars(&entry.name, 16);
                             ui.painter().text(Pos2::new(row_rect.min.x + 4.0, row_rect.center().y), Align2::LEFT_CENTER, name_preview, FontId::proportional(11.0), Color32::from_rgb(232, 234, 237));
 
                             let status_color = if entry.status >= 200 && entry.status < 300 {
@@ -2761,6 +2918,128 @@ fn render_zoom_row(
     }
 }
 
+/// Shortens to `max` characters. Byte-indexed slicing panics whenever the cut
+/// lands inside a multi-byte character, and page titles are full of them.
+fn preview_chars(text: &str, max: usize) -> String {
+    let mut preview: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        preview.push_str("...");
+    }
+    preview
+}
+
+/// Chrome-style network error document, rendered by Aether's own engine.
+fn chrome_error_page_html(err: &crate::network::LoadError) -> String {
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let title = escape(&err.title);
+    let description = escape(&err.description);
+    let code = escape(&err.code);
+    let hint = escape(err.hint());
+    let url = escape(&err.url);
+
+    format!(
+        "<html><body style='background-color: #202124; color: #e8eaed; font-family: sans-serif; margin: 0; padding: 0;'><div style='max-width: 620px; margin: 56px 0 0 72px;'><div style='width: 48px; height: 48px; border-radius: 24px; background-color: #ea4335; margin-bottom: 24px;'></div><h1 style='font-size: 22px; color: #e8eaed; margin: 0 0 16px 0;'>{title}</h1><p style='font-size: 14px; color: #9aa0a6; margin: 0 0 12px 0;'>{description}</p><p style='font-size: 14px; color: #8ab4f8; margin: 0 0 24px 0;'>{url}</p><div style='padding: 16px 20px; background-color: #303134; border-radius: 8px; margin-bottom: 24px;'><p style='font-size: 13px; color: #dadce0; margin: 0 0 8px 0;'>Try:</p><p style='font-size: 13px; margin: 0;'><span style='color: #f28b82;'>{code}</span></p></div><p style='font-size: 13px; color: #9aa0a6; margin: 0 0 28px 0;'>{hint}</p><span style='display: inline-block; padding: 10px 24px; background-color: #8ab4f8; color: #202124; border-radius: 4px; font-size: 13px;'>Reload</span></div></body></html>"
+    )
+}
+
+/// Maps one frame's input state to a Chrome shortcut, if any. `typing_in_field`
+/// suppresses bare navigation keys so text editing keeps working.
+pub fn detect_chrome_shortcut(i: &egui::InputState, typing_in_field: bool) -> Option<ChromeShortcut> {
+    let m = i.modifiers;
+    let ctrl = m.ctrl || m.command;
+    let pressed = |k: Key| i.key_pressed(k);
+
+    if ctrl && !m.alt {
+        if pressed(Key::T) {
+            return Some(if m.shift { ChromeShortcut::ReopenClosedTab } else { ChromeShortcut::NewTab });
+        }
+        if pressed(Key::W) {
+            return Some(ChromeShortcut::CloseTab);
+        }
+        if pressed(Key::L) || pressed(Key::F6) {
+            return Some(ChromeShortcut::FocusOmnibox);
+        }
+        if pressed(Key::R) || pressed(Key::F5) {
+            return Some(ChromeShortcut::Reload);
+        }
+        if pressed(Key::Tab) {
+            return Some(if m.shift { ChromeShortcut::PrevTab } else { ChromeShortcut::NextTab });
+        }
+        if pressed(Key::Plus) || pressed(Key::Equals) {
+            return Some(ChromeShortcut::ZoomIn);
+        }
+        if pressed(Key::Minus) {
+            return Some(ChromeShortcut::ZoomOut);
+        }
+        if pressed(Key::Num0) {
+            return Some(ChromeShortcut::ZoomReset);
+        }
+        let tabs = [
+            (Key::Num1, 0usize),
+            (Key::Num2, 1),
+            (Key::Num3, 2),
+            (Key::Num4, 3),
+            (Key::Num5, 4),
+            (Key::Num6, 5),
+            (Key::Num7, 6),
+            (Key::Num8, 7),
+        ];
+        for (key, idx) in tabs {
+            if pressed(key) {
+                return Some(ChromeShortcut::SelectTab(idx));
+            }
+        }
+        if pressed(Key::Num9) {
+            return Some(ChromeShortcut::LastTab);
+        }
+        return None;
+    }
+
+    if m.alt {
+        if pressed(Key::ArrowLeft) {
+            return Some(ChromeShortcut::Back);
+        }
+        if pressed(Key::ArrowRight) {
+            return Some(ChromeShortcut::Forward);
+        }
+        return None;
+    }
+
+    if pressed(Key::F5) {
+        return Some(ChromeShortcut::Reload);
+    }
+    if pressed(Key::Escape) {
+        return Some(ChromeShortcut::Escape);
+    }
+    if typing_in_field {
+        return None;
+    }
+    if pressed(Key::PageDown) {
+        return Some(ChromeShortcut::Scroll(ScrollIntent::Pages(0.9)));
+    }
+    if pressed(Key::PageUp) {
+        return Some(ChromeShortcut::Scroll(ScrollIntent::Pages(-0.9)));
+    }
+    if pressed(Key::Home) {
+        return Some(ChromeShortcut::Scroll(ScrollIntent::Top));
+    }
+    if pressed(Key::End) {
+        return Some(ChromeShortcut::Scroll(ScrollIntent::Bottom));
+    }
+    if pressed(Key::ArrowDown) {
+        return Some(ChromeShortcut::Scroll(ScrollIntent::Lines(3)));
+    }
+    if pressed(Key::ArrowUp) {
+        return Some(ChromeShortcut::Scroll(ScrollIntent::Lines(-3)));
+    }
+    None
+}
+
 fn format_current_time() -> String {
     if let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         let total_secs = duration.as_secs();
@@ -3005,7 +3284,7 @@ fn render_dom_tree_node(
                 ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, "=\"", FontId::monospace(11.0), Color32::from_rgb(128, 134, 139));
                 cursor_x += 12.0;
 
-                let val_preview = if attr_v.len() > 24 { format!("{}...", &attr_v[..22]) } else { attr_v.clone() };
+                let val_preview = preview_chars(attr_v, 22);
                 ui.painter().text(Pos2::new(cursor_x, rect.center().y), Align2::LEFT_CENTER, &val_preview, FontId::monospace(11.0), Color32::from_rgb(129, 201, 149));
                 cursor_x += (val_preview.len() as f32) * 6.6;
 
@@ -3072,7 +3351,7 @@ fn render_dom_tree_node(
                 }
 
                 let indent_x = rect.min.x + (depth as f32) * 14.0 + 18.0;
-                let preview = if trimmed.len() > 48 { format!("\"{}...\"", &trimmed[..45]) } else { format!("\"{}\"", trimmed) };
+                let preview = format!("\"{}\"", preview_chars(trimmed, 45));
                 ui.painter().text(Pos2::new(indent_x, rect.center().y), Align2::LEFT_CENTER, preview, FontId::monospace(10.5), Color32::from_rgb(232, 234, 237));
             }
         }

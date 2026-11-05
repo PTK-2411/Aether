@@ -7,3 +7,4 @@ pub mod layout;
 pub mod network;
 pub mod render;
 pub mod style;
+pub mod text_metrics;

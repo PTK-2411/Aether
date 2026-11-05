@@ -18,7 +18,7 @@ pub struct PageResponse {
 pub enum NetworkMessage {
     PageLoaded {
         tab_id: usize,
-        result: Result<PageResponse, String>,
+        result: Result<PageResponse, LoadError>,
     },
 }
 
@@ -173,7 +173,169 @@ pub fn resolve_relative_url(base_url: &str, href: &str) -> String {
     trimmed_href.to_string()
 }
 
-fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
+#[derive(Debug, Clone)]
+pub struct LoadError {
+    /// Chrome-style net error code, e.g. `ERR_NAME_NOT_RESOLVED`.
+    pub code: String,
+    /// Heading shown on the error page, e.g. "This site can't be reached".
+    pub title: String,
+    /// One-sentence explanation of what went wrong.
+    pub description: String,
+    /// Underlying transport message, kept for DevTools/console.
+    pub detail: String,
+    pub url: String,
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.description)
+    }
+}
+
+impl LoadError {
+    /// Practical next step, shown under the error code like Chrome does.
+    pub fn hint(&self) -> &'static str {
+        match self.code.as_str() {
+            "ERR_NAME_NOT_RESOLVED" => {
+                "Try checking the address for typos, or verify that your network's DNS server is reachable."
+            }
+            "ERR_CONNECTION_TIMED_OUT" => {
+                "Try reloading once the server is back; a firewall or an idle host can cause this."
+            }
+            _ if self.code.starts_with("NET::ERR_CERT") => {
+                "If you own this site, its certificate must list this hostname — a certificate issued for another domain will always be rejected."
+            }
+            "ERR_CONNECTION_REFUSED" => {
+                "Make sure the server is running and accepting connections on this port."
+            }
+            "ERR_TOO_MANY_REDIRECTS" => {
+                "Clearing cookies for this site usually breaks a redirect loop."
+            }
+            "ERR_FILE_NOT_FOUND" => {
+                "Check the path, or drag the file onto the window to open it."
+            }
+            _ => "Try reloading the page, then check your internet connection.",
+        }
+    }
+}
+
+fn host_of(url_str: &str) -> String {
+    Url::parse(url_str)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| url_str.to_string())
+}
+
+/// Turns a reqwest failure into the closest Chrome net-error code plus a
+/// human-readable explanation, instead of leaking the raw transport string.
+fn classify_load_error(err: &reqwest::Error, url_str: &str) -> LoadError {
+    let mut detail = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(s) = source {
+        let msg = s.to_string();
+        if !detail.contains(&msg) {
+            detail.push_str(&format!(" — {}", msg));
+        }
+        source = std::error::Error::source(s);
+    }
+    let lower = detail.to_ascii_lowercase();
+    let host = host_of(url_str);
+
+    let (code, title, description) = if lower.contains("invalid peer certificate")
+        || lower.contains("certificate")
+        || lower.contains("rustls")
+    {
+        let (cert_code, reason) = if lower.contains("not valid for name")
+            || lower.contains("common name")
+            || lower.contains("hostname mismatch")
+        {
+            (
+                "NET::ERR_CERT_COMMON_NAME_INVALID",
+                format!(
+                    "{}'s security certificate isn't valid for this hostname — it was issued for a different site, so the connection was blocked.",
+                    host
+                ),
+            )
+        } else if lower.contains("expired") {
+            (
+                "NET::ERR_CERT_DATE_INVALID",
+                format!("{}'s security certificate has expired.", host),
+            )
+        } else {
+            (
+                "NET::ERR_CERT_AUTHORITY_INVALID",
+                format!(
+                    "{}'s security certificate isn't trusted, so the connection was blocked.",
+                    host
+                ),
+            )
+        };
+        (cert_code, "Your connection isn't private", reason)
+    } else if lower.contains("failed to lookup address information")
+        || lower.contains("name or service not known")
+        || lower.contains("nodename nor servname")
+        || lower.contains("no address associated")
+        || lower.contains("dns error")
+    {
+        (
+            "ERR_NAME_NOT_RESOLVED",
+            "This site can't be reached",
+            format!("{}'s server IP address could not be found. Check the spelling, the network connection, or the DNS settings.", host),
+        )
+    } else if err.is_timeout() {
+        (
+            "ERR_CONNECTION_TIMED_OUT",
+            "This site can't be reached",
+            format!("{} took too long to respond.", host),
+        )
+    } else if lower.contains("connection refused") {
+        (
+            "ERR_CONNECTION_REFUSED",
+            "This site can't be reached",
+            format!("{} refused the connection.", host),
+        )
+    } else if lower.contains("reset") || lower.contains("broken pipe") {
+        (
+            "ERR_CONNECTION_RESET",
+            "The connection was reset",
+            format!("The connection to {} was closed unexpectedly.", host),
+        )
+    } else if lower.contains("invalid data") || lower.contains("malformed") {
+        (
+            "ERR_INVALID_RESPONSE",
+            "This page isn't working",
+            format!("{} sent a response that Aether couldn't understand.", host),
+        )
+    } else if err.is_redirect() {
+        (
+            "ERR_TOO_MANY_REDIRECTS",
+            "The page isn't redirecting properly",
+            format!("{} has redirected too many times to load the page.", host),
+        )
+    } else if err.is_decode() {
+        (
+            "ERR_CONTENT_DECODING_FAILED",
+            "This page isn't working",
+            format!("{} sent compressed data that couldn't be decoded.", host),
+        )
+    } else {
+        (
+            "ERR_NETWORK",
+            "This site can't be reached",
+            format!("Aether could not open the page at {} because the network connection failed.", host),
+        )
+    };
+
+    LoadError {
+        code: code.to_string(),
+        title: title.to_string(),
+        description,
+        detail,
+        url: url_str.to_string(),
+    }
+}
+
+fn fetch_url_content(url_str: &str) -> Result<PageResponse, LoadError> {
     if url_str == "about:welcome" || url_str == "about:home" || url_str == "about:newtab" {
         return Ok(PageResponse {
             url: "about:newtab".to_string(),
@@ -240,8 +402,9 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
     }
 
     if let Some(file_path) = url_str.strip_prefix("file://") {
-        match std::fs::read_to_string(file_path) {
-            Ok(content) => {
+        match std::fs::read(file_path) {
+            Ok(bytes) => {
+                let content = decode_body(&bytes, None);
                 let sheet_urls = extract_stylesheet_urls(&content);
                 let mut external_css = Vec::new();
                 let base_path = std::path::Path::new(file_path).parent().unwrap_or(std::path::Path::new(""));
@@ -264,20 +427,15 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
                 });
             }
             Err(e) => {
-                return Err(format!("Failed to read local file '{}': {}", file_path, e));
+                return Err(LoadError {
+                    code: "ERR_FILE_NOT_FOUND".to_string(),
+                    title: "This site isn't available".to_string(),
+                    description: format!("Aether could not open the local file {}.", file_path),
+                    detail: e.to_string(),
+                    url: url_str.to_string(),
+                });
             }
         }
-    }
-
-    // Intercept search queries to return real, rich, clean search results without anti-bot blocks
-    if url_str.starts_with("https://search.aether.local")
-        || url_str.starts_with("about:search")
-        || url_str.starts_with("https://www.google.com/search")
-        || url_str.starts_with("https://google.com/search")
-        || url_str.starts_with("http://www.google.com/search")
-    {
-        let query = extract_query_param(url_str, "q").unwrap_or_else(|| "Search".to_string());
-        return Ok(generate_aether_search_results(&query, url_str));
     }
 
     // HTTP / HTTPS fetching via reqwest
@@ -286,14 +444,20 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Aether/1.0")
         .timeout(std::time::Duration::from_secs(12))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| LoadError {
+            code: "ERR_INTERNET_DISCONNECTED".to_string(),
+            title: "Aether can't connect to the network".to_string(),
+            description: "The browser could not set up a secure connection.".to_string(),
+            detail: e.to_string(),
+            url: url_str.to_string(),
+        })?;
 
     let response = client
         .get(url_str)
         .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         .header("Accept-Language", "en-US,en;q=0.9,vi;q=0.8")
         .send()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| classify_load_error(&e, url_str))?;
     let status = response.status().as_u16();
     let status_text = response.status().canonical_reason().unwrap_or("").to_string();
     let headers: Vec<(String, String)> = response
@@ -302,37 +466,48 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
     let final_url = response.url().to_string();
-    let body = response.text().map_err(|e| e.to_string())?;
+    let body_bytes = response.bytes().map_err(|e| classify_load_error(&e, url_str))?;
+    let content_type = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str());
+    let body = decode_body(&body_bytes, content_type);
     let duration_ms = start_time.elapsed().as_millis() as u64;
 
-    let title = extract_title_or(&body, &final_url);
+    // Search engines answer a scriptless client with an empty shell. Rather
+    // than painting a blank page, replay the same query against engines that
+    // do serve plain HTML, and say on the page which one answered. Every
+    // result below comes from a live engine; nothing is composed here.
+    let (final_url, body) = if is_search_results_url(&final_url) {
+        live_search_body(&final_url, body)
+    } else {
+        (final_url, body)
+    };
 
-    // If an external page is a JS-heavy SPA with near-empty static body, provide a helpful notice
+    let page_title = extract_title_or(&body, &final_url);
+
+    // Pages whose static HTML carries no text at all (JS renders everything)
+    // get a plain explanation instead of a wall of empty skeleton placeholders.
     let final_html = {
-        let text_chars = body.chars().filter(|c| c.is_alphanumeric()).count();
-        if text_chars < 180 && (body.contains("<noscript") || body.contains("id=\"root\"") || body.contains("id=\"app\"") || body.contains("<script")) {
-            let notice = r#"<div style="background-color:#2a2415; color:#fdd663; padding:12px 20px; font-family:sans-serif; font-size:13px; border-bottom:1px solid #7c5810; margin-bottom:16px;">
-                <strong>ℹ️ Notice:</strong> This website is an interactive Single Page Application (SPA) requiring a JavaScript engine. Aether's pure-Rust engine displays standard HTML5/CSS3. <a href="about:ai" style="color:#8ab4f8; font-weight:bold; margin-left:8px;">Open Aether AI Mode &rarr;</a>
-            </div>"#;
-            if let Some(pos) = body.to_ascii_lowercase().find("<body") {
-                if let Some(close_offset) = body[pos..].find('>') {
-                    let insert_pos = pos + close_offset + 1;
-                    let mut modified = body.clone();
-                    modified.insert_str(insert_pos, notice);
-                    modified
-                } else {
-                    format!("{}{}", notice, body)
-                }
-            } else {
-                format!("{}{}", notice, body)
-            }
+        let visible = visible_text_len(&body);
+        let lower = body.to_ascii_lowercase();
+        let has_scripts = lower.contains("<script");
+        let is_script_heavy = body.len() > 60_000
+            || lower.contains("id=\"root\"")
+            || lower.contains("id=\"app\"")
+            || lower.contains("data-reactroot")
+            || lower.contains("ng-app");
+        if visible < 250 && has_scripts && is_script_heavy {
+            embedded_json_content_html(&final_url, &body)
+                .unwrap_or_else(|| spa_notice_html(&final_url, &page_title))
         } else {
             body.clone()
         }
     };
+    let title = extract_title_or(&final_html, &final_url);
 
     let mut external_css = Vec::new();
-    let sheet_urls = extract_stylesheet_urls(&body);
+    let sheet_urls = extract_stylesheet_urls(&final_html);
     for raw_href in sheet_urls {
         let resolved = resolve_relative_url(&final_url, &raw_href);
         if resolved.starts_with("http://") || resolved.starts_with("https://") {
@@ -369,6 +544,357 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         headers,
         duration_ms,
     })
+}
+
+/// Decode a response body using the charset from the HTTP header, an HTML
+/// `<meta charset>` declaration, or UTF-8 as a last resort.
+pub fn decode_body(bytes: &[u8], content_type: Option<&str>) -> String {
+    if let Some(label) = content_type.and_then(charset_from_content_type) {
+        if let Some(decoded) = decode_with_label(bytes, &label) {
+            return decoded;
+        }
+    }
+    if let Some(label) = sniff_meta_charset(bytes) {
+        if let Some(decoded) = decode_with_label(bytes, &label) {
+            return decoded;
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    content_type
+        .to_ascii_lowercase()
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("charset=").map(|c| c.trim_matches('"').to_string()))
+}
+
+/// Looks for `<meta charset=...>` or `<meta http-equiv=content-type; charset=...>`
+/// in the leading bytes, where such declarations must appear to be honoured.
+fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
+    let head = &bytes[..bytes.len().min(2048)];
+    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find("<meta") {
+        let start = search_from + rel;
+        let end = text[start..].find('>').map(|r| start + r + 1).unwrap_or(text.len());
+        let tag = &text[start..end];
+        if let Some(idx) = tag.find("charset") {
+            let rest = tag[idx + 7..].trim_start_matches([' ', '=', '"', '\'']);
+            let label: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+                .collect();
+            if !label.is_empty() {
+                return Some(label);
+            }
+        }
+        search_from = end;
+    }
+    None
+}
+
+/// Latin-1 / windows-1252 byte-to-codepoint tables differ only in 0x80..0x9F;
+/// the printable half is identical to Unicode, so a 128-entry table suffices.
+const WINDOWS_1252_HIGH: [char; 32] = [
+    '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}', '\u{017D}', '\u{FFFD}',
+    '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+];
+
+fn byte_to_char(b: u8, windows_1252: bool) -> char {
+    if b < 0x80 {
+        b as char
+    } else if windows_1252 && (b as usize) < 0xA0 {
+        WINDOWS_1252_HIGH[b as usize - 0x80]
+    } else {
+        b as char
+    }
+}
+
+fn decode_with_label(bytes: &[u8], label: &str) -> Option<String> {
+    let norm = label.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    match norm.as_str() {
+        "utf-8" | "utf8" => Some(
+            String::from_utf8(bytes.to_vec())
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        ),
+        "iso-8859-1" | "latin1" => Some(bytes.iter().map(|&b| byte_to_char(b, false)).collect()),
+        "windows-1252" | "win-1252" | "cp1252" => {
+            Some(bytes.iter().map(|&b| byte_to_char(b, true)).collect())
+        }
+        "us-ascii" | "ascii" => Some(String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    }
+}
+
+/// Length of the text a no-JS renderer can actually show: script/style/template
+/// payloads and comments are dropped, then tags are stripped and whitespace
+/// collapsed. Used to detect pages whose content only exists after JS runs.
+pub fn visible_text_len(html: &str) -> usize {
+    let without_comments = strip_comments(html);
+    let without_scripts = strip_element_bodies(&without_comments, &["script", "style", "template", "noscript"]);
+    let without_tags = strip_tags(&without_scripts);
+    without_tags.split_whitespace().map(|w| w.chars().count()).sum()
+}
+
+fn strip_comments(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        let end = rest[start..]
+            .find("-->")
+            .map(|r| start + r + 3)
+            .unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_element_bodies(html: &str, tags: &[&str]) -> String {
+    let mut out = String::with_capacity(html.len());
+    let lower = html.to_ascii_lowercase();
+    let mut pos = 0;
+    while pos < html.len() {
+        let mut nearest: Option<(usize, &str)> = None;
+        for tag in tags {
+            let open = format!("<{}", tag);
+            if let Some(rel) = lower[pos..].find(&open) {
+                let abs = pos + rel;
+                let followed_by_boundary = lower[abs + open.len()..]
+                    .chars()
+                    .next()
+                    .map_or(true, |c| c == '>' || c.is_whitespace() || c == '/');
+                if followed_by_boundary && nearest.map_or(true, |(n, _)| abs < n) {
+                    nearest = Some((abs, *tag));
+                }
+            }
+        }
+        let Some((start, tag)) = nearest else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        out.push_str(&html[pos..start]);
+        let open_end = lower[start..].find('>').map(|r| start + r + 1).unwrap_or(html.len());
+        let close = format!("</{}>", tag);
+        let resume = lower[open_end..]
+            .find(&close)
+            .map(|r| open_end + r + close.len())
+            .unwrap_or(html.len());
+        pos = resume.min(html.len());
+    }
+    out
+}
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Notice shown instead of a JS-only page, whose static HTML has no content.
+fn spa_notice_html(url: &str, title: &str) -> String {
+    let host = host_of(url);
+    let safe_title = title.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        "<html><head><title>{safe_title}</title></head><body style='background-color: #202124; color: #e8eaed; font-family: sans-serif; margin: 0;'><div style='max-width: 560px; margin: 64px 0 0 64px;'><h1 style='font-size: 22px; color: #e8eaed; margin: 0 0 16px 0;'>{host} needs JavaScript to show its content</h1><p style='font-size: 14px; color: #9aa0a6; margin: 0 0 12px 0;'>Aether renders plain HTML and CSS with no JavaScript engine, so this page's text never arrives — scripts fetch it after load. Only empty placeholders would be visible.</p><p style='font-size: 13px; color: #9aa0a6; margin: 0;'>Open the original page in a JavaScript-capable browser: <a href='{url}' style='color: #8ab4f8;'>{url}</a></p></div></body></html>"
+    )
+}
+
+/// Sites that build themselves in JavaScript still ship their real content as
+/// a JSON blob in the first response. Reading that blob shows true page data;
+/// nothing here is invented.
+pub fn embedded_json_content_html(url: &str, html: &str) -> Option<String> {
+    if !url.contains("youtube.com") {
+        return None;
+    }
+    let (page_title, content) = if url.contains("/watch") {
+        watch_page_content(html)?
+    } else {
+        feed_page_content(url, html)?
+    };
+    let banner = format!(
+        "<div style=\"background:#e8f0fe;color:#11274f;padding:10px 16px;font-size:13px\">Real page data embedded by YouTube in its first response. The player needs JavaScript, so to watch: <a href=\"{url}\">{url}</a></div>"
+    );
+    Some(format!(
+        "<html><head><title>{}</title></head><body>{banner}{}</body></html>",
+        escape_html_text(&page_title),
+        content
+    ))
+}
+
+/// The JSON object that starts just after an assignment such as
+/// `var ytInitialData =`. Braces inside strings are ignored.
+fn extract_json_object_after(html: &str, marker: &str) -> Option<serde_json::Value> {
+    let start = html.find(marker)? + marker.len();
+    let rest = &html[start..];
+    let open = rest.find('{')?;
+    let bytes = rest.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in bytes[open..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let slice = &rest[open..open + offset + 1];
+                    return serde_json::from_str(slice).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn json_str(value: &serde_json::Value, path: &str) -> String {
+    value
+        .get(path)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn runs_text(value: &serde_json::Value) -> String {
+    value
+        .get("runs")
+        .and_then(|runs| runs.get(0))
+        .and_then(|run| run.get("text"))
+        .and_then(|text| text.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn watch_page_content(html: &str) -> Option<(String, String)> {
+    let player = extract_json_object_after(html, "var ytInitialPlayerResponse")?;
+    let details = player.get("videoDetails")?;
+    let title = json_str(details, "title");
+    if title.trim().is_empty() {
+        return None;
+    }
+    let author = json_str(details, "author");
+    let views = json_str(details, "viewCount");
+    let channel = json_str(details, "channelId");
+    let seconds: u64 = json_str(details, "lengthSeconds").parse().unwrap_or(0);
+    let description = json_str(details, "shortDescription");
+    let author_link = if channel.is_empty() {
+        escape_html_text(&author)
+    } else {
+        format!(
+            "<a href=\"https://www.youtube.com/channel/{channel}\">{}</a>",
+            escape_html_text(&author)
+        )
+    };
+    let body = description
+        .lines()
+        .map(escape_html_text)
+        .collect::<Vec<String>>()
+        .join("<br>");
+    let content = format!(
+        "<div style=\"max-width:760px;margin:24px auto;font-family:sans-serif\"><h1>{}</h1><p>{} · {} views · {} min</p><div>{}</div></div>",
+        escape_html_text(&title),
+        author_link,
+        views,
+        seconds / 60,
+        body
+    );
+    Some((title, content))
+}
+
+fn feed_page_content(url: &str, html: &str) -> Option<(String, String)> {
+    let data = extract_json_object_after(html, "var ytInitialData")?;
+    let mut entries: Vec<(String, String, String)> = Vec::new();
+    collect_video_renderers(&data, 0, &mut entries);
+    if entries.is_empty() {
+        return None;
+    }
+    let heading = match extract_query_param(url, "search_query") {
+        Some(q) if !q.trim().is_empty() => format!("{q} - YouTube search results"),
+        _ => "YouTube".to_string(),
+    };
+    let items = entries
+        .iter()
+        .map(|(video_id, title, meta)| {
+            format!(
+                "<li style=\"margin:0 0 14px 0\"><a href=\"https://www.youtube.com/watch?v={video_id}\">{}</a><div style=\"font-size:13px;color:#606060\">{}</div></li>",
+                escape_html_text(title),
+                escape_html_text(meta)
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("");
+    Some((
+        heading.clone(),
+        format!(
+            "<div style=\"max-width:760px;margin:24px auto;font-family:sans-serif\"><h1>{}</h1><ul>{items}</ul></div>",
+            escape_html_text(&heading)
+        ),
+    ))
+}
+
+fn collect_video_renderers(
+    value: &serde_json::Value,
+    depth: u32,
+    out: &mut Vec<(String, String, String)>,
+) {
+    if depth > 40 || out.len() >= 30 {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(video) = map.get("videoRenderer") {
+                let title = runs_text(video.get("title").unwrap_or(&serde_json::Value::Null));
+                let video_id = json_str(video, "videoId");
+                if !title.trim().is_empty() && !video_id.is_empty() {
+                    let owner = runs_text(
+                        video
+                            .get("ownerText")
+                            .unwrap_or(&serde_json::Value::Null),
+                    );
+                    let published = json_str(
+                        video
+                            .get("publishedTimeText")
+                            .unwrap_or(&serde_json::Value::Null),
+                        "simpleText",
+                    );
+                    out.push((video_id, title, format!("{owner} {published}").trim().to_string()));
+                }
+            }
+            for child in map.values() {
+                collect_video_renderers(child, depth + 1, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_video_renderers(item, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn extract_css_imports(css: &str) -> Vec<String> {
@@ -480,210 +1006,167 @@ fn extract_query_param(url_str: &str, param: &str) -> Option<String> {
     None
 }
 
-fn generate_aether_search_results(query: &str, url_str: &str) -> PageResponse {
-    let encoded_query = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
-    let api_url = format!(
-        "https://vi.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch={}&gsrlimit=8&prop=pageimages|extracts&piprop=thumbnail&pithumbsize=240&exintro=1&explaintext=1&exsentences=2&format=json&utf8=1",
-        encoded_query
-    );
+/// A search results page, whichever engine produced it.
+pub fn is_search_results_url(url_str: &str) -> bool {
+    const RESULTS_PATHS: [&str; 8] = [
+        "google.com/search",
+        "bing.com/search",
+        "duckduckgo.com/html",
+        "duckduckgo.com/lite",
+        "search.yahoo.com/search",
+        "ecosia.org/search",
+        "mojeek.com/search",
+        "brave.com/search",
+    ];
+    let lower = url_str.to_ascii_lowercase();
+    RESULTS_PATHS.iter().any(|path| lower.contains(path))
+}
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("Aether/1.0 (Mozilla/5.0; Pure Rust)")
-        .timeout(std::time::Duration::from_secs(4))
-        .build();
+/// Links that point at the indexed web instead of at the engine itself. A
+/// response with none of these carries no results, whatever its status code.
+pub fn organic_result_links(html: &str) -> usize {
+    const ENGINE_HOSTS: [&str; 9] = [
+        "google.com",
+        "googleusercontent.com",
+        "gstatic.com",
+        "bing.com",
+        "duckduckgo.com",
+        "yahoo.com",
+        "ecosia.org",
+        "mojeek.com",
+        "brave.com",
+    ];
+    let mut count = 0usize;
+    let mut rest = html;
+    while let Some(start) = rest.find("href=\"http") {
+        let after = &rest[start + 6..];
+        let Some(end) = after.find('"') else { break };
+        let href = &after[..end];
+        if !ENGINE_HOSTS.iter().any(|host| href.contains(host)) {
+            count += 1;
+        }
+        rest = &after[end..];
+    }
+    count
+}
 
-    let mut results_html = String::new();
-    let mut count = 0;
+const MIN_ORGANIC_RESULTS: usize = 3;
 
-    if let Ok(ref c) = client {
-        if let Ok(resp) = c.get(&api_url).send() {
-            if let Ok(json_text) = resp.text() {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_text) {
-                    if let Some(pages) = val["query"]["pages"].as_object() {
-                        for (_page_id, page) in pages.iter() {
-                            if let (Some(title), Some(extract)) = (page["title"].as_str(), page["extract"].as_str()) {
-                                count += 1;
-                                let page_title_encoded = url::form_urlencoded::byte_serialize(title.as_bytes()).collect::<String>();
-                                let page_url = format!("https://vi.wikipedia.org/wiki/{}", page_title_encoded);
-                                let thumb_html = if let Some(thumb_src) = page["thumbnail"]["source"].as_str() {
-                                    format!(r#"<div style="margin-top: 6px; margin-bottom: 8px;"><img src="{}" width="160" height="110" alt="{}"></div>"#, thumb_src, title)
-                                } else {
-                                    String::new()
-                                };
-                                results_html.push_str(&format!(
-                                    r#"<div class="card">
-                                        <div class="cite">https://vi.wikipedia.org › wiki › {}</div>
-                                        <h3><a href="{}">{}</a></h3>
-                                        {}
-                                        <p class="desc">{}</p>
-                                    </div>"#,
-                                    title, page_url, title, thumb_html, extract
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
+/// Search engines reject an address that claims to be Chrome but arrives with
+/// a Rust TLS fingerprint, and accept one that says what it is. Being truthful
+/// is also what these plain-HTML endpoints are built for.
+fn plain_reader_client() -> reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .user_agent("Aether/1.0 (scriptless HTML reader)")
+                .timeout(std::time::Duration::from_secs(12))
+                .build()
+                .expect("client with only defaults builds")
+        })
+        .clone()
+}
+
+/// Keeps the engine's own answer when it contains results; otherwise replays
+/// the query against plain-HTML engines and returns their live page.
+fn live_search_body(url_str: &str, body: String) -> (String, String) {
+    if organic_result_links(&body) >= MIN_ORGANIC_RESULTS {
+        return (url_str.to_string(), body);
+    }
+    let Some(query) = extract_query_param(url_str, "q") else {
+        return (url_str.to_string(), body);
+    };
+    let encoded = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+    let fallbacks = [
+        // Brave still serves a full static results page to a scriptless client;
+        // DuckDuckGo's html/ and lite/ endpoints are built for the same job but
+        // challenge repeated addresses more eagerly.
+        ("Brave", format!("https://search.brave.com/search?q={encoded}&source=web")),
+        ("DuckDuckGo", format!("https://html.duckduckgo.com/html/?q={encoded}")),
+        ("DuckDuckGo Lite", format!("https://lite.duckduckgo.com/lite/?q={encoded}")),
+        ("Bing", format!("https://www.bing.com/search?q={encoded}&count=20")),
+        ("Mojeek", format!("https://www.mojeek.com/search?q={encoded}")),
+        ("Ecosia", format!("https://www.ecosia.org/search?q={encoded}")),
+    ];
+    // Whichever engine answered last time is tried first now, so an ordinary
+    // search costs two requests instead of six. Fewer requests is the difference
+    // between being treated as a browser and being throttled as a scraper.
+    let start = LAST_ANSWERING_ENGINE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .min(fallbacks.len() - 1);
+    let reader = plain_reader_client();
+    for step in 0..fallbacks.len() {
+        let index = (start + step) % fallbacks.len();
+        let (engine, fallback_url) = (&fallbacks[index].0, &fallbacks[index].1);
+        let Ok(response) = reader
+            .get(fallback_url)
+            .header("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .send()
+        else {
+            continue;
+        };
+        let Ok(text) = response.text() else { continue };
+        if organic_result_links(&text) >= MIN_ORGANIC_RESULTS {
+            LAST_ANSWERING_ENGINE.store(index, std::sync::atomic::Ordering::Relaxed);
+            let notice = search_source_notice(&query, engine, fallback_url);
+            return (fallback_url.clone(), inject_after_opening_body(&text, &notice));
         }
     }
+    (url_str.to_string(), search_unanswered_html(&query, url_str))
+}
 
-    // Fallback search API if generator returned nothing
-    if results_html.is_empty() {
-        let fallback_url = format!(
-            "https://vi.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&format=json&utf8=1",
-            encoded_query
-        );
-        if let Ok(ref c) = client {
-            if let Ok(resp) = c.get(&fallback_url).send() {
-                if let Ok(json_text) = resp.text() {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_text) {
-                        if let Some(search_items) = val["query"]["search"].as_array() {
-                            for item in search_items.iter().take(8) {
-                                if let (Some(title), Some(snippet)) = (item["title"].as_str(), item["snippet"].as_str()) {
-                                    count += 1;
-                                    let clean_snippet = snippet
-                                        .replace("<span class=\"searchmatch\">", "")
-                                        .replace("</span>", "")
-                                        .replace("&quot;", "\"")
-                                        .replace("&amp;", "&");
-                                    let page_title_encoded = url::form_urlencoded::byte_serialize(title.as_bytes()).collect::<String>();
-                                    let page_url = format!("https://vi.wikipedia.org/wiki/{}", page_title_encoded);
+static LAST_ANSWERING_ENGINE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
-                                    results_html.push_str(&format!(
-                                        r#"<div class="card">
-                                            <div class="cite">https://vi.wikipedia.org › wiki › {}</div>
-                                            <h3><a href="{}">{}</a></h3>
-                                            <p class="desc">{}...</p>
-                                        </div>"#,
-                                        title, page_url, title, clean_snippet
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+/// No plain-HTML engine answered this time. Say so plainly rather than leaving
+/// the user with an empty shell that looks like a broken renderer.
+fn search_unanswered_html(query: &str, url_str: &str) -> String {
+    format!(
+        "<html><head><title>No results for {q}</title></head><body><div style=\"max-width:640px;margin:32px auto;font-family:sans-serif\"><h1>No results for {q}</h1><p style=\"font-size:14px\">Google answered with a page that needs JavaScript, and Brave, Bing, DuckDuckGo, DuckDuckGo Lite, Mojeek and Ecosia returned nothing usable for this query just now. Aether only paints results that a live engine actually sent; it will not fill the page in on your behalf.</p><p style=\"font-size:14px\">Try the search again, or open the original page: <a href=\"{u}\">{u}</a></p></div></body></html>",
+        q = escape_html_text(query),
+        u = escape_html_text(url_str)
+    )
+}
+
+/// Banner naming the engine that actually answered, so the page never looks
+/// like a locally invented results list.
+pub fn search_source_notice(query: &str, engine: &str, engine_url: &str) -> String {
+    format!(
+        "<div style=\"background:#fef7e0;color:#5f4b00;padding:10px 16px;font-size:13px\">Google returned a page that needs JavaScript. These are live results from <a href=\"{engine_url}\">{engine}</a> for \u{201c}{}\u{201d}.</div>",
+        escape_html_text(query)
+    )
+}
+
+fn escape_html_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
         }
     }
+    out
+}
 
-    if results_html.is_empty() {
-        results_html = format!(
-            r#"<div class="card">
-                <div class="cite">https://duckduckgo.com › search › {}</div>
-                <h3><a href="https://html.duckduckgo.com/html/?q={}">Search: {} on DuckDuckGo</a></h3>
-                <p class="desc">Explore open search results for "{}" without third-party bot challenges.</p>
-            </div>
-            <div class="card">
-                <div class="cite">https://en.wikipedia.org › wiki › {}</div>
-                <h3><a href="https://en.wikipedia.org/wiki/Special:Search?search={}">View Wikipedia Encyclopedia results for "{}"</a></h3>
-                <p class="desc">Look up articles, research, and technical definitions in Wikipedia.</p>
-            </div>"#,
-            query, encoded_query, query, query, query, encoded_query, query
-        );
-        count = 2;
+/// Drops a fragment in just inside `<body>`, falling back to a prepended block.
+pub fn inject_after_opening_body(html: &str, fragment: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    if let Some(tag_start) = lower.find("<body") {
+        if let Some(rel_end) = lower[tag_start..].find('>') {
+            let insert_at = tag_start + rel_end + 1;
+            let mut out = String::with_capacity(html.len() + fragment.len());
+            out.push_str(&html[..insert_at]);
+            out.push_str(fragment);
+            out.push_str(&html[insert_at..]);
+            return out;
+        }
     }
-
-    let stats_text = format!("About {} results (0.12 seconds)", (count * 12450) + 128);
-
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>{} - Google Search</title>
-    <style>
-        body {{
-            font-family: sans-serif;
-            margin: 0;
-            padding: 16px 28px;
-            background-color: #202124;
-            color: #bdc1c6;
-        }}
-        .content {{
-            max-width: 800px;
-        }}
-        .brand-bar {{
-            padding: 8px 0 16px 0;
-            display: flex;
-            align-items: center;
-        }}
-        .brand-logo {{
-            color: #8ab4f8;
-            font-size: 20px;
-            font-weight: bold;
-        }}
-        .stats {{
-            color: #9aa0a6;
-            font-size: 13px;
-            margin-bottom: 18px;
-        }}
-        .card {{
-            margin-bottom: 26px;
-        }}
-        .cite {{
-            color: #9aa0a6;
-            font-size: 12px;
-            margin-bottom: 4px;
-        }}
-        h3 {{
-            margin: 0 0 6px 0;
-            font-size: 20px;
-        }}
-        h3 a {{
-            color: #8ab4f8;
-            text-decoration: none;
-        }}
-        h3 a:hover {{
-            text-decoration: underline;
-        }}
-        .desc {{
-            color: #bdc1c6;
-            font-size: 14px;
-            line-height: 1.58;
-            margin: 0;
-        }}
-        .knowledge {{
-            background-color: #303134;
-            border: 1px solid #3c4043;
-            border-radius: 8px;
-            padding: 16px;
-            margin-bottom: 24px;
-        }}
-        .knowledge h2 {{
-            color: #ffffff;
-            margin-top: 0;
-            font-size: 22px;
-        }}
-    </style>
-</head>
-<body>
-    <div class="content">
-        <div class="brand-bar">
-            <span class="brand-logo">Google Search</span>
-        </div>
-        <div class="stats">{}</div>
-
-        <div class="knowledge">
-            <h2>Search results for "{}"</h2>
-            <p class="desc">Results synthesized by Aether Search Engine, connecting to open encyclopedias and web resources.</p>
-        </div>
-
-        {}
-    </div>
-</body>
-</html>"#,
-        query, stats_text, query, results_html
-    );
-
-    PageResponse {
-        url: url_str.to_string(),
-        html,
-        external_css: Vec::new(),
-        title: format!("{} - Google Search", query),
-        status: 200,
-        status_text: "OK".to_string(),
-        headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
-        duration_ms: 15,
-    }
+    format!("{fragment}{html}")
 }
 
 pub const AI_MODE_HTML: &str = r#"
