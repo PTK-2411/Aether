@@ -545,8 +545,12 @@ impl BrowserApp {
                                 // Parse HTML to DOM
                                 let dom = HtmlParser::parse(&tab.raw_html);
 
-                                // Collect internal styles
+                                // Collect styles: User-Agent + External Stylesheets + Internal style tags
                                 let mut css_source = DEFAULT_USER_AGENT_CSS.to_string();
+                                for ext_css in &res.external_css {
+                                    css_source.push('\n');
+                                    css_source.push_str(ext_css);
+                                }
                                 collect_style_tags(&dom, &mut css_source);
 
                                 tab.stylesheet = CssParser::parse(&css_source);
@@ -677,37 +681,52 @@ impl BrowserApp {
     }
 }
 
-fn fetch_and_decode_image(src: &str, tx: std::sync::mpsc::Sender<(String, egui::ColorImage)>) {
-    if src.starts_with("data:image/") {
-        if let Some(comma_pos) = src.find(',') {
-            let data_part = &src[comma_pos + 1..];
+fn fetch_and_decode_image(key: &str, fetch_url: &str, tx: std::sync::mpsc::Sender<(String, egui::ColorImage)>) {
+    if fetch_url.starts_with("data:image/") {
+        if let Some(comma_pos) = fetch_url.find(',') {
+            let data_part = &fetch_url[comma_pos + 1..];
             if let Ok(bytes) = base64_decode(data_part) {
                 if let Ok(dyn_img) = image::load_from_memory(&bytes) {
                     let rgba = dyn_img.to_rgba8();
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
-                    let _ = tx.send((src.to_string(), color_img));
+                    let _ = tx.send((key.to_string(), color_img));
                     return;
                 }
             }
         }
     }
 
-    if src.starts_with("http://") || src.starts_with("https://") {
+    let url_to_fetch = if fetch_url.starts_with("//") {
+        format!("https:{}", fetch_url)
+    } else {
+        fetch_url.to_string()
+    };
+
+    if url_to_fetch.starts_with("http://") || url_to_fetch.starts_with("https://") {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(6))
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .build();
         if let Ok(c) = client {
-            if let Ok(resp) = c.get(src).send() {
+            if let Ok(resp) = c.get(&url_to_fetch).send() {
                 if let Ok(bytes) = resp.bytes() {
                     if let Ok(dyn_img) = image::load_from_memory(&bytes) {
                         let rgba = dyn_img.to_rgba8();
                         let size = [rgba.width() as usize, rgba.height() as usize];
                         let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
-                        let _ = tx.send((src.to_string(), color_img));
+                        let _ = tx.send((key.to_string(), color_img));
                     }
                 }
+            }
+        }
+    } else if let Some(path) = url_to_fetch.strip_prefix("file://") {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                let rgba = dyn_img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
+                let _ = tx.send((key.to_string(), color_img));
             }
         }
     }
@@ -787,6 +806,36 @@ fn fetch_search_suggestions(query: &str, tx: std::sync::mpsc::Sender<(String, Ve
     let _ = tx.send((query.to_string(), suggestions));
 }
 
+fn draw_tab_shield_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let top_y = center.y - 6.0;
+    let mid_y = center.y - 1.0;
+    let bot_y = center.y + 6.5;
+    let left_x = center.x - 5.5;
+    let right_x = center.x + 5.5;
+    let mid_x = center.x;
+    let stroke = Stroke::new(1.1_f32, color);
+
+    // Outer shield outline (Image 2 design)
+    painter.line_segment([Pos2::new(left_x, top_y), Pos2::new(right_x, top_y)], stroke);
+    painter.line_segment([Pos2::new(left_x, top_y), Pos2::new(left_x, mid_y)], stroke);
+    painter.line_segment([Pos2::new(right_x, top_y), Pos2::new(right_x, mid_y)], stroke);
+    painter.line_segment([Pos2::new(left_x, mid_y), Pos2::new(mid_x, bot_y)], stroke);
+    painter.line_segment([Pos2::new(right_x, mid_y), Pos2::new(mid_x, bot_y)], stroke);
+
+    // Inner subtle shield emblem
+    let in_stroke = Stroke::new(0.9_f32, color.gamma_multiply(0.6));
+    let in_l = center.x - 2.8;
+    let in_r = center.x + 2.8;
+    let in_t = center.y - 3.2;
+    let in_m = center.y;
+    let in_b = center.y + 3.2;
+    painter.line_segment([Pos2::new(in_l, in_t), Pos2::new(in_r, in_t)], in_stroke);
+    painter.line_segment([Pos2::new(in_l, in_t), Pos2::new(in_l, in_m)], in_stroke);
+    painter.line_segment([Pos2::new(in_r, in_t), Pos2::new(in_r, in_m)], in_stroke);
+    painter.line_segment([Pos2::new(in_l, in_m), Pos2::new(mid_x, in_b)], in_stroke);
+    painter.line_segment([Pos2::new(in_r, in_m), Pos2::new(mid_x, in_b)], in_stroke);
+}
+
 fn collect_style_tags(node: &Node, out: &mut String) {
     if node.tag_name() == Some("noscript") {
         return; // Never collect styles inside noscript (anti-bot blockers)
@@ -826,6 +875,7 @@ impl eframe::App for BrowserApp {
 
         // Look for unrendered images in active tab's display list and trigger downloads
         if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            let tab_url = tab.url.clone();
             if let Some(ref dl) = tab.display_list {
                 for item in &dl.items {
                     if let crate::render::DisplayItem::Image { src, .. } = item {
@@ -835,9 +885,10 @@ impl eframe::App for BrowserApp {
                         {
                             self.loading_images.insert(src.clone());
                             let src_c = src.clone();
+                            let fetch_url = resolve_relative_url(&tab_url, &src_c);
                             let tx = self.image_tx.clone();
                             std::thread::spawn(move || {
-                                fetch_and_decode_image(&src_c, tx);
+                                fetch_and_decode_image(&src_c, &fetch_url, tx);
                             });
                         }
                     }
@@ -982,16 +1033,27 @@ impl BrowserApp {
             for (idx, tab) in self.tabs.iter().enumerate() {
                 let is_active = idx == self.active_tab_idx;
 
+                // Vertical divider before inactive tabs (Image 2 style)
+                if !is_active && (idx == 0 || idx.saturating_sub(1) != self.active_tab_idx) {
+                    let (sep_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 18.0), egui::Sense::hover());
+                    ui.painter().vline(
+                        sep_rect.center().x,
+                        (sep_rect.center().y - 7.0)..=(sep_rect.center().y + 7.0),
+                        Stroke::new(1.0_f32, Color32::from_rgb(58, 62, 68)),
+                    );
+                    ui.add_space(2.0);
+                }
+
                 let tab_bg = if is_active {
-                    Color32::from_rgb(50, 54, 57) // #323639
+                    Color32::from_rgb(52, 55, 60) // Rounded active pill background matching Image 2
                 } else {
                     Color32::TRANSPARENT
                 };
 
                 let tab_text_color = if is_active {
-                    Color32::from_rgb(241, 243, 244)
+                    Color32::WHITE
                 } else {
-                    Color32::from_rgb(154, 160, 166)
+                    Color32::from_rgb(175, 180, 188)
                 };
 
                 let frame = Frame::NONE
@@ -1003,18 +1065,17 @@ impl BrowserApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
 
-                        // Aether "A" icon or loading dot
+                        // Shield icon (Image 2 design) or loading dot
                         if tab.is_loading {
                             ui.label(RichText::new("●").size(10.0).color(Color32::from_rgb(251, 188, 4)));
-                        } else if tab.is_new_tab() {
-                            // Mini Aether A circle
-                            let (a_rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
-                            ui.painter().circle_filled(a_rect.center(), 7.0, Color32::from_rgb(138, 180, 248));
-                            ui.painter().text(a_rect.center(), Align2::CENTER_CENTER, "A", FontId::proportional(9.0), Color32::from_rgb(20, 21, 24));
                         } else {
-                            let (w_rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
-                            ui.painter().circle_stroke(w_rect.center(), 6.0, Stroke::new(1.0_f32, Color32::from_rgb(154, 160, 166)));
-                            ui.painter().line_segment([Pos2::new(w_rect.min.x, w_rect.center().y), Pos2::new(w_rect.max.x, w_rect.center().y)], Stroke::new(1.0_f32, Color32::from_rgb(154, 160, 166)));
+                            let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
+                            let icon_color = if is_active {
+                                Color32::from_rgb(220, 224, 230)
+                            } else {
+                                Color32::from_rgb(150, 155, 163)
+                            };
+                            draw_tab_shield_icon(ui.painter(), icon_rect.center(), icon_color);
                         }
 
                         // Tab title
@@ -1034,17 +1095,19 @@ impl BrowserApp {
                             self.address_input = if tab.is_new_tab() { String::new() } else { tab.url.clone() };
                         }
 
-                        // Tab Close button 'x' (Guaranteed 100% vector drawn)
-                        let (c_rect, c_resp) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::click());
-                        let center = c_rect.center();
-                        if c_resp.hovered() {
-                            ui.painter().circle_filled(center, 7.0, Color32::from_rgb(70, 74, 80));
-                        }
-                        let x_color = if c_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(170, 175, 180) };
-                        ui.painter().line_segment([center - Vec2::splat(3.0), center + Vec2::splat(3.0)], Stroke::new(1.2_f32, x_color));
-                        ui.painter().line_segment([Pos2::new(center.x - 3.0, center.y + 3.0), Pos2::new(center.x + 3.0, center.y - 3.0)], Stroke::new(1.2_f32, x_color));
-                        if c_resp.clicked() {
-                            close_tab_idx = Some(idx);
+                        // Tab Close button 'x': displayed on active tab or when hovered
+                        if is_active {
+                            let (c_rect, c_resp) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::click());
+                            let center = c_rect.center();
+                            if c_resp.hovered() {
+                                ui.painter().circle_filled(center, 7.0, Color32::from_rgb(70, 74, 80));
+                            }
+                            let x_color = if c_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(170, 175, 180) };
+                            ui.painter().line_segment([center - Vec2::splat(3.0), center + Vec2::splat(3.0)], Stroke::new(1.2_f32, x_color));
+                            ui.painter().line_segment([Pos2::new(center.x - 3.0, center.y + 3.0), Pos2::new(center.x + 3.0, center.y - 3.0)], Stroke::new(1.2_f32, x_color));
+                            if c_resp.clicked() {
+                                close_tab_idx = Some(idx);
+                            }
                         }
                     });
                 });

@@ -100,7 +100,39 @@ impl HtmlParser {
             self.consume_char(); // consume ';'
         }
 
-        match entity_name.as_str() {
+        Self::resolve_entity_name(&entity_name)
+    }
+
+    pub fn decode_string_entities(s: &str) -> String {
+        if !s.contains('&') {
+            return s.to_string();
+        }
+        let mut result = String::with_capacity(s.len());
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '&' {
+                let start = i + 1;
+                let mut end = start;
+                while end < chars.len() && chars[end] != ';' && !chars[end].is_whitespace() && (end - start) < 10 {
+                    end += 1;
+                }
+                if end < chars.len() && chars[end] == ';' {
+                    let entity_name: String = chars[start..end].iter().collect();
+                    let decoded = Self::resolve_entity_name(&entity_name);
+                    result.push_str(&decoded);
+                    i = end + 1;
+                    continue;
+                }
+            }
+            result.push(chars[i]);
+            i += 1;
+        }
+        result
+    }
+
+    fn resolve_entity_name(entity_name: &str) -> String {
+        match entity_name {
             "amp" => "&".to_string(),
             "lt" => "<".to_string(),
             "gt" => ">".to_string(),
@@ -113,6 +145,17 @@ impl HtmlParser {
             "euro" => "€".to_string(),
             "copy" => "©".to_string(),
             "reg" => "®".to_string(),
+            "ndash" => "–".to_string(),
+            "mdash" => "—".to_string(),
+            "bull" => "•".to_string(),
+            "hellip" => "…".to_string(),
+            "rsquo" => "’".to_string(),
+            "lsquo" => "‘".to_string(),
+            "rdquo" => "”".to_string(),
+            "ldquo" => "“".to_string(),
+            "times" => "×".to_string(),
+            "divide" => "÷".to_string(),
+            "deg" => "°".to_string(),
             _ => {
                 if let Some(stripped) = entity_name.strip_prefix('#') {
                     if let Some(hex) = stripped.strip_prefix('x') {
@@ -176,13 +219,16 @@ impl HtmlParser {
 
         // Consume closing tag </tag_name>
         if self.starts_with("</") {
+            let save_pos = self.pos;
             self.consume_str("</");
             let close_tag = self.parse_tag_name();
             self.consume_whitespace();
             if self.curr_char() == '>' {
                 self.consume_char();
             }
-            let _ = close_tag;
+            if close_tag != tag_name {
+                self.pos = save_pos;
+            }
         }
 
         Node {
@@ -251,7 +297,7 @@ impl HtmlParser {
             return String::new();
         }
         let quote = self.curr_char();
-        if quote == '"' || quote == '\'' {
+        let raw = if quote == '"' || quote == '\'' {
             self.consume_char();
             let val = self.consume_while(|c| c != quote);
             if !self.eof() && self.curr_char() == quote {
@@ -260,7 +306,8 @@ impl HtmlParser {
             val
         } else {
             self.consume_while(|c| !c.is_whitespace() && c != '>')
-        }
+        };
+        Self::decode_string_entities(&raw)
     }
 
     fn consume_whitespace(&mut self) {

@@ -7,6 +7,7 @@ use url::Url;
 pub struct PageResponse {
     pub url: String,
     pub html: String,
+    pub external_css: Vec<String>,
     pub title: String,
     pub status: u16,
     pub status_text: String,
@@ -155,6 +156,14 @@ pub fn resolve_relative_url(base_url: &str, href: &str) -> String {
         return trimmed_href.to_string();
     }
 
+    if trimmed_href.starts_with("//") {
+        if base_url.starts_with("http://") {
+            return format!("http:{}", trimmed_href);
+        } else {
+            return format!("https:{}", trimmed_href);
+        }
+    }
+
     if let Ok(base) = Url::parse(base_url) {
         if let Ok(resolved) = base.join(trimmed_href) {
             return resolved.to_string();
@@ -169,6 +178,7 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         return Ok(PageResponse {
             url: "about:newtab".to_string(),
             html: WELCOME_HTML.to_string(),
+            external_css: Vec::new(),
             title: "New Tab".to_string(),
             status: 200,
             status_text: "OK".to_string(),
@@ -181,6 +191,7 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         return Ok(PageResponse {
             url: "about:ai".to_string(),
             html: AI_MODE_HTML.to_string(),
+            external_css: Vec::new(),
             title: "Aether AI Mode".to_string(),
             status: 200,
             status_text: "OK".to_string(),
@@ -193,6 +204,7 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         return Ok(PageResponse {
             url: url_str.to_string(),
             html: TEST_SUITE_HTML.to_string(),
+            external_css: Vec::new(),
             title: "CSS & DOM Test Suite".to_string(),
             status: 200,
             status_text: "OK".to_string(),
@@ -205,6 +217,7 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         return Ok(PageResponse {
             url: url_str.to_string(),
             html: CREDITS_HTML.to_string(),
+            external_css: Vec::new(),
             title: "Credits & Engine Architecture".to_string(),
             status: 200,
             status_text: "OK".to_string(),
@@ -217,6 +230,7 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
         return Ok(PageResponse {
             url: url_str.to_string(),
             html: "<html><body></body></html>".to_string(),
+            external_css: Vec::new(),
             title: "Blank Tab".to_string(),
             status: 200,
             status_text: "OK".to_string(),
@@ -228,10 +242,21 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
     if let Some(file_path) = url_str.strip_prefix("file://") {
         match std::fs::read_to_string(file_path) {
             Ok(content) => {
+                let sheet_urls = extract_stylesheet_urls(&content);
+                let mut external_css = Vec::new();
+                let base_path = std::path::Path::new(file_path).parent().unwrap_or(std::path::Path::new(""));
+                for raw_href in sheet_urls {
+                    let resolved_path = base_path.join(&raw_href);
+                    if let Ok(css_text) = std::fs::read_to_string(resolved_path) {
+                        external_css.push(css_text);
+                    }
+                }
+
                 return Ok(PageResponse {
                     url: url_str.to_string(),
                     title: file_path.to_string(),
                     html: content,
+                    external_css,
                     status: 200,
                     status_text: "OK".to_string(),
                     headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -302,19 +327,86 @@ fn fetch_url_content(url_str: &str) -> Result<PageResponse, String> {
                 format!("{}{}", notice, body)
             }
         } else {
-            body
+            body.clone()
         }
     };
+
+    let mut external_css = Vec::new();
+    let sheet_urls = extract_stylesheet_urls(&body);
+    for raw_href in sheet_urls {
+        let resolved = resolve_relative_url(&final_url, &raw_href);
+        if resolved.starts_with("http://") || resolved.starts_with("https://") {
+            if let Ok(css_resp) = client.get(&resolved).header("Accept", "text/css,*/*;q=0.1").send() {
+                if css_resp.status().is_success() {
+                    if let Ok(css_text) = css_resp.text() {
+                        external_css.push(css_text);
+                    }
+                }
+            }
+        }
+    }
 
     Ok(PageResponse {
         url: final_url,
         html: final_html,
+        external_css,
         title,
         status,
         status_text,
         headers,
         duration_ms,
     })
+}
+
+fn extract_stylesheet_urls(html: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut search_pos = 0;
+    while let Some(link_idx) = lower[search_pos..].find("<link") {
+        let abs_start = search_pos + link_idx;
+        let end_idx = match lower[abs_start..].find('>') {
+            Some(i) => abs_start + i,
+            None => break,
+        };
+        let tag_slice = &html[abs_start..=end_idx];
+        let tag_lower = tag_slice.to_ascii_lowercase();
+
+        if tag_lower.contains("rel=\"stylesheet\"")
+            || tag_lower.contains("rel='stylesheet'")
+            || tag_lower.contains("rel=stylesheet")
+            || (tag_lower.contains("as=\"style\"") && tag_lower.contains("rel=\"preload\""))
+        {
+            if let Some(href_val) = extract_attribute_value(tag_slice, "href") {
+                let decoded = crate::html_parser::HtmlParser::decode_string_entities(&href_val);
+                urls.push(decoded);
+            }
+        }
+        search_pos = end_idx + 1;
+    }
+    urls
+}
+
+fn extract_attribute_value(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let pattern = format!("{}=", attr);
+    if let Some(idx) = lower.find(&pattern) {
+        let after_eq = tag[idx + pattern.len()..].trim_start();
+        if after_eq.starts_with('"') {
+            if let Some(end) = after_eq[1..].find('"') {
+                return Some(after_eq[1..=end].to_string());
+            }
+        } else if after_eq.starts_with('\'') {
+            if let Some(end) = after_eq[1..].find('\'') {
+                return Some(after_eq[1..=end].to_string());
+            }
+        } else {
+            let val: String = after_eq.chars().take_while(|c| !c.is_whitespace() && *c != '>').collect();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
 }
 
 fn extract_title_or(html: &str, default_title: &str) -> String {
@@ -557,6 +649,7 @@ fn generate_aether_search_results(query: &str, url_str: &str) -> PageResponse {
     PageResponse {
         url: url_str.to_string(),
         html,
+        external_css: Vec::new(),
         title: format!("{} - Google Search", query),
         status: 200,
         status_text: "OK".to_string(),

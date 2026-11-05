@@ -289,3 +289,175 @@ fn test_image_layout_and_display_item() {
     assert_eq!(rect.width, 120.0);
     assert_eq!(rect.height, 80.0);
 }
+
+#[test]
+fn test_css_attribute_selectors_and_not() {
+    let css = r#"
+        [hidden] { display: none !important; }
+        input[type="search"] { background-color: #f0f0f0; }
+        a[href^="https://"] { color: #0000ff; }
+        div:not(.hidden) { display: block; }
+    "#;
+    let stylesheet = CssParser::parse(css);
+    assert!(!stylesheet.rules.is_empty());
+
+    let html = r#"
+        <div>
+            <div id="d1" hidden="true">Hidden Item</div>
+            <input id="s1" type="search" />
+            <a id="l1" href="https://wikipedia.org">Wiki</a>
+        </div>
+    "#;
+    let dom = HtmlParser::parse(html);
+    let styled = style_tree(&dom, &stylesheet);
+
+    // Find hidden item
+    fn find_styled_by_id<'a>(sn: &'a rust_browser::style::StyledNode<'a>, id: &str) -> Option<&'a rust_browser::style::StyledNode<'a>> {
+        if sn.node.get_attribute("id") == Some(id) {
+            return Some(sn);
+        }
+        for c in &sn.children {
+            if let Some(found) = find_styled_by_id(c, id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let d1 = find_styled_by_id(&styled, "d1").unwrap();
+    assert_eq!(d1.display(), rust_browser::style::Display::None);
+
+    let s1 = find_styled_by_id(&styled, "s1").unwrap();
+    assert_eq!(s1.value("background-color"), Some(&Value::ColorValue(CssColor::new(0xf0, 0xf0, 0xf0, 255))));
+
+    let l1 = find_styled_by_id(&styled, "l1").unwrap();
+    assert_eq!(l1.value("color"), Some(&Value::ColorValue(CssColor::new(0, 0, 255, 255))));
+}
+
+#[test]
+fn test_css_media_queries_and_important_override() {
+    let css = r#"
+        p { color: #111111; }
+        @media screen {
+            p { color: #222222; }
+        }
+        @media print {
+            p { color: #999999 !important; }
+        }
+        .special { color: #333333; }
+        p.special { color: #444444; }
+        .override-rule { color: #555555 !important; }
+    "#;
+    let stylesheet = CssParser::parse(css);
+    // Print media must be ignored, screen media must be kept
+    let html = r#"<div><p class="special override-rule">Text</p></div>"#;
+    let dom = HtmlParser::parse(html);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let p = &styled.children[0].children[0];
+    // !important overrides higher specificity class rule
+    assert_eq!(p.value("color"), Some(&Value::ColorValue(CssColor::new(0x55, 0x55, 0x55, 255))));
+}
+
+#[test]
+fn test_nested_inline_element_positioning_not_zero() {
+    let html = r#"<div><p>Start <a href="https://example.com"><span>Click Here</span></a> End</p></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(rust_browser::default_style::DEFAULT_USER_AGENT_CSS);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 600.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let display_list = rust_browser::render::build_display_list(&layout_root);
+    let text_items: Vec<_> = display_list
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            rust_browser::render::DisplayItem::Text { text, pos, .. } => Some((text.as_str(), pos.x, pos.y)),
+            _ => None,
+        })
+        .collect();
+
+    assert!(text_items.len() >= 4, "Expected at least 4 text fragments: {:?}", text_items);
+
+    // Verify coordinates are strictly advancing horizontally
+    let mut last_x = -1.0;
+    for (txt, x, y) in &text_items {
+        assert!(*x >= 0.0, "Text fragment '{}' has negative x", txt);
+        assert!(*y >= 0.0, "Text fragment '{}' has negative y", txt);
+        assert!(*x > last_x, "Text fragment '{}' at x={} overlaps or is before previous at x={}", txt, x, last_x);
+        last_x = *x;
+    }
+}
+
+#[test]
+fn test_flexbox_row_layout() {
+    let css = r#"
+        .flex-container { display: flex; width: 600px; }
+        .col-1 { width: 200px; height: 50px; }
+        .col-2 { width: 300px; height: 80px; }
+    "#;
+    let html = r#"<div class="flex-container"><div class="col-1">Item1</div><div class="col-2">Item2</div></div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 600.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let flex_container = &layout_root.children[0];
+    assert_eq!(flex_container.children.len(), 2);
+    let child1 = &flex_container.children[0];
+    let child2 = &flex_container.children[1];
+
+    assert_eq!(child1.dimensions.content.x, 0.0);
+    assert_eq!(child1.dimensions.content.width, 200.0);
+    assert!(child2.dimensions.content.x >= 200.0, "Flex child 2 must be positioned after flex child 1: x={}", child2.dimensions.content.x);
+    assert_eq!(child2.dimensions.content.width, 300.0);
+}
+
+#[test]
+fn test_protocol_relative_url_and_box_sizing() {
+    let base = "https://en.wikipedia.org/wiki/Rust";
+    assert_eq!(
+        resolve_relative_url(base, "//upload.wikimedia.org/wikipedia/commons/logo.png"),
+        "https://upload.wikimedia.org/wikipedia/commons/logo.png"
+    );
+
+    let css = r#"
+        .box { box-sizing: border-box; width: 200px; padding-left: 20px; padding-right: 20px; border-left-width: 5px; border-right-width: 5px; }
+    "#;
+    let html = r#"<div class="box">Content</div>"#;
+    let dom = HtmlParser::parse(html);
+    let stylesheet = CssParser::parse(css);
+    let styled = style_tree(&dom, &stylesheet);
+
+    let mut layout_root = build_layout_tree(&styled).unwrap();
+    let viewport = Dimensions {
+        content: Rect::new(0.0, 0.0, 800.0, 600.0),
+        padding: EdgeSizes::default(),
+        border: EdgeSizes::default(),
+        margin: EdgeSizes::default(),
+    };
+    layout_root.layout(viewport);
+
+    let box_elem = &layout_root.children[0];
+    // Total border box width must equal specified 200px
+    assert_eq!(box_elem.dimensions.border_box().width, 200.0);
+    // Content width must be 200 - 40(padding) - 10(border) = 150px
+    assert_eq!(box_elem.dimensions.content.width, 150.0);
+}
+

@@ -19,8 +19,17 @@ pub struct Selector {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectorPart {
     Simple(SimpleSelector),
-    DescendantCombinator, // space
-    ChildCombinator,      // >
+    DescendantCombinator,        // space
+    ChildCombinator,             // >
+    AdjacentSiblingCombinator,   // +
+    GeneralSiblingCombinator,    // ~
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeSelector {
+    pub name: String,
+    pub op: Option<String>,
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -28,6 +37,10 @@ pub struct SimpleSelector {
     pub tag_name: Option<String>,
     pub id: Option<String>,
     pub classes: Vec<String>,
+    pub attributes: Vec<AttributeSelector>,
+    pub pseudo_classes: Vec<String>,
+    pub pseudo_element: Option<String>,
+    pub not_selectors: Vec<SimpleSelector>,
     pub universal: bool,
 }
 
@@ -44,7 +57,22 @@ impl Selector {
                 if s.id.is_some() {
                     id_count += 1;
                 }
-                class_count += s.classes.len();
+                class_count += s.classes.len() + s.attributes.len() + s.pseudo_classes.len();
+                if s.pseudo_element.is_some() {
+                    tag_count += 1;
+                }
+                for not_sel in &s.not_selectors {
+                    if not_sel.id.is_some() {
+                        id_count += 1;
+                    }
+                    class_count += not_sel.classes.len() + not_sel.attributes.len() + not_sel.pseudo_classes.len();
+                    if not_sel.pseudo_element.is_some() {
+                        tag_count += 1;
+                    }
+                    if not_sel.tag_name.is_some() {
+                        tag_count += 1;
+                    }
+                }
                 if s.tag_name.is_some() {
                     tag_count += 1;
                 }
@@ -58,6 +86,7 @@ impl Selector {
 pub struct Declaration {
     pub name: String,
     pub value: Value,
+    pub important: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,8 +156,12 @@ impl CssParser {
             if self.eof() {
                 break;
             }
+            if self.starts_with("@media") {
+                self.parse_media_rule(&mut rules);
+                continue;
+            }
             if self.starts_with("@") {
-                // Skip @media, @import, @keyframes for simplicity
+                // Skip other at-rules like @keyframes, @font-face
                 self.skip_at_rule();
                 continue;
             }
@@ -137,6 +170,48 @@ impl CssParser {
             }
         }
         Stylesheet { rules }
+    }
+
+    fn parse_media_rule(&mut self, rules: &mut Vec<Rule>) {
+        self.consume_str("@media");
+        self.consume_whitespace();
+        let mut query = String::new();
+        while !self.eof() && self.curr_char() != '{' {
+            query.push(self.consume_char());
+        }
+        if self.curr_char() == '{' {
+            self.consume_char();
+        }
+        let q_lower = query.to_ascii_lowercase();
+        // Skip print-only stylesheets
+        let is_print_only = q_lower.contains("print") && !q_lower.contains("screen") && !q_lower.contains("all");
+        if is_print_only {
+            let mut depth = 1;
+            while !self.eof() && depth > 0 {
+                let c = self.consume_char();
+                if c == '{' { depth += 1; }
+                else if c == '}' { depth -= 1; }
+            }
+            return;
+        }
+
+        // Parse nested rules until matching closing brace
+        while !self.eof() {
+            self.consume_whitespace_and_comments();
+            if self.eof() || self.curr_char() == '}' {
+                if self.curr_char() == '}' {
+                    self.consume_char();
+                }
+                break;
+            }
+            if self.starts_with("@") {
+                self.skip_at_rule();
+                continue;
+            }
+            if let Some(rule) = self.parse_rule() {
+                rules.push(rule);
+            }
+        }
     }
 
     fn skip_at_rule(&mut self) {
@@ -162,11 +237,19 @@ impl CssParser {
     fn parse_rule(&mut self) -> Option<Rule> {
         let selectors = self.parse_selectors();
         if selectors.is_empty() {
-            // Error recovery: skip to next closing brace
-            while !self.eof() && self.curr_char() != '}' {
+            // Error recovery: skip to next closing brace or block
+            while !self.eof() && self.curr_char() != '}' && self.curr_char() != '{' {
                 self.consume_char();
             }
-            if !self.eof() && self.curr_char() == '}' {
+            if !self.eof() && self.curr_char() == '{' {
+                self.consume_char();
+                let mut depth = 1;
+                while !self.eof() && depth > 0 {
+                    let c = self.consume_char();
+                    if c == '{' { depth += 1; }
+                    else if c == '}' { depth -= 1; }
+                }
+            } else if !self.eof() && self.curr_char() == '}' {
                 self.consume_char();
             }
             return None;
@@ -174,9 +257,17 @@ impl CssParser {
 
         self.consume_whitespace_and_comments();
         if self.curr_char() != '{' {
-            return None;
+            while !self.eof() && self.curr_char() != '{' && self.curr_char() != '}' {
+                self.consume_char();
+            }
+            if self.curr_char() == '{' {
+                self.consume_char();
+            } else {
+                return None;
+            }
+        } else {
+            self.consume_char(); // consume '{'
         }
-        self.consume_char(); // consume '{'
 
         let declarations = self.parse_declarations();
 
@@ -200,6 +291,11 @@ impl CssParser {
             }
             if let Some(sel) = self.parse_selector() {
                 selectors.push(sel);
+            } else {
+                // If this selector is invalid, skip until ',' or '{'
+                while !self.eof() && self.curr_char() != ',' && self.curr_char() != '{' {
+                    self.consume_char();
+                }
             }
             self.consume_whitespace_and_comments();
             if self.curr_char() == ',' {
@@ -232,8 +328,24 @@ impl CssParser {
                 continue;
             }
 
+            if self.curr_char() == '+' {
+                self.consume_char();
+                parts.push(SelectorPart::AdjacentSiblingCombinator);
+                had_whitespace_before = false;
+                continue;
+            }
+
+            if self.curr_char() == '~' {
+                self.consume_char();
+                parts.push(SelectorPart::GeneralSiblingCombinator);
+                had_whitespace_before = false;
+                continue;
+            }
+
             if had_whitespace_before {
-                parts.push(SelectorPart::DescendantCombinator);
+                if matches!(parts.last(), Some(SelectorPart::Simple(_))) {
+                    parts.push(SelectorPart::DescendantCombinator);
+                }
                 had_whitespace_before = false;
             }
 
@@ -276,12 +388,92 @@ impl CssParser {
                     selector.classes.push(self.parse_identifier());
                     parsed_any = true;
                 }
+                '[' => {
+                    self.consume_char(); // consume '['
+                    self.consume_whitespace();
+                    let attr_name = self.consume_while(|c| is_identifier_char(c) || c == '-').to_ascii_lowercase();
+                    self.consume_whitespace();
+                    let mut op = None;
+                    let mut val = None;
+                    if self.curr_char() == '=' {
+                        self.consume_char();
+                        op = Some("=".to_string());
+                    } else if (self.curr_char() == '~' || self.curr_char() == '|' || self.curr_char() == '^' || self.curr_char() == '$' || self.curr_char() == '*')
+                        && self.peek_char(1) == '='
+                    {
+                        let c1 = self.consume_char();
+                        let c2 = self.consume_char();
+                        op = Some(format!("{}{}", c1, c2));
+                    }
+                    if op.is_some() {
+                        self.consume_whitespace();
+                        let quote = self.curr_char();
+                        let attr_val = if quote == '"' || quote == '\'' {
+                            self.consume_char();
+                            let s = self.consume_while(|c| c != quote);
+                            if self.curr_char() == quote {
+                                self.consume_char();
+                            }
+                            s
+                        } else {
+                            self.consume_while(|c| c != ']' && !c.is_whitespace())
+                        };
+                        val = Some(attr_val);
+                    }
+                    self.consume_whitespace();
+                    if self.curr_char() == ']' {
+                        self.consume_char();
+                    }
+                    if !attr_name.is_empty() {
+                        selector.attributes.push(AttributeSelector {
+                            name: attr_name,
+                            op,
+                            value: val,
+                        });
+                        parsed_any = true;
+                    }
+                }
                 ':' => {
-                    // pseudo-class like :hover
                     self.consume_char();
-                    let _pseudo = self.parse_identifier();
-                    // for now ignore pseudo-classes or could be recorded
-                    parsed_any = true;
+                    // Optional double-colon for pseudo-elements (::before, ::after)
+                    let is_double_colon = if self.curr_char() == ':' {
+                        self.consume_char();
+                        true
+                    } else {
+                        false
+                    };
+                    let pseudo = self.parse_identifier();
+                    let pseudo_lower = pseudo.to_ascii_lowercase();
+                    if self.curr_char() == '(' {
+                        self.consume_char();
+                        if pseudo_lower == "not" {
+                            if let Some(inner) = self.parse_simple_selector() {
+                                selector.not_selectors.push(inner);
+                            }
+                        }
+                        // consume balanced parentheses
+                        let mut depth = 1;
+                        while !self.eof() && depth > 0 {
+                            let c = self.consume_char();
+                            if c == '(' {
+                                depth += 1;
+                            } else if c == ')' {
+                                depth -= 1;
+                            }
+                        }
+                    }
+                    if is_double_colon
+                        || matches!(
+                            pseudo_lower.as_str(),
+                            "before" | "after" | "placeholder" | "-webkit-scrollbar" | "selection" | "backdrop" | "marker"
+                        )
+                    {
+                        selector.pseudo_element = Some(pseudo_lower);
+                        parsed_any = true;
+                    } else if pseudo_lower != "not" && !pseudo.is_empty() {
+                        selector.pseudo_classes.push(pseudo_lower);
+                        parsed_any = true;
+                    }
                 }
                 _ => break,
             }
@@ -301,9 +493,9 @@ impl CssParser {
             if self.eof() || self.curr_char() == '}' {
                 break;
             }
-            let (name, value_str) = self.parse_declaration_pair();
+            let (name, value_str, important) = self.parse_declaration_pair();
             if !name.is_empty() && !value_str.is_empty() {
-                self.expand_and_add(&name, &value_str, &mut declarations);
+                self.expand_and_add(&name, &value_str, important, &mut declarations);
             }
             self.consume_whitespace_and_comments();
             if self.curr_char() == ';' {
@@ -313,24 +505,74 @@ impl CssParser {
         declarations
     }
 
-    fn parse_declaration_pair(&mut self) -> (String, String) {
+    fn parse_declaration_pair(&mut self) -> (String, String, bool) {
         let name = self.parse_identifier().to_ascii_lowercase();
         self.consume_whitespace();
         if self.curr_char() != ':' {
-            return (String::new(), String::new());
+            while !self.eof() && self.curr_char() != ';' && self.curr_char() != '}' {
+                self.consume_char();
+            }
+            return (String::new(), String::new(), false);
         }
         self.consume_char(); // consume ':'
         self.consume_whitespace();
 
         let mut value = String::new();
         while !self.eof() && self.curr_char() != ';' && self.curr_char() != '}' {
+            if self.starts_with("/*") {
+                self.consume_str("/*");
+                while !self.eof() && !self.starts_with("*/") {
+                    self.consume_char();
+                }
+                if self.starts_with("*/") {
+                    self.consume_str("*/");
+                }
+                continue;
+            }
             value.push(self.consume_char());
         }
-        (name, value.trim().to_string())
+
+        let mut trimmed = value.trim();
+        let mut important = false;
+        if trimmed.to_ascii_lowercase().ends_with("!important") {
+            important = true;
+            trimmed = trimmed[..trimmed.len() - "!important".len()].trim();
+        } else if let Some(stripped) = trimmed.strip_suffix("! important") {
+            important = true;
+            trimmed = stripped.trim();
+        }
+
+        (name, trimmed.to_string(), important)
     }
 
-    fn expand_and_add(&self, name: &str, raw_value: &str, out: &mut Vec<Declaration>) {
-        let tokens: Vec<&str> = raw_value.split_whitespace().collect();
+    fn split_css_tokens(s: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut cur = String::new();
+        let mut paren_depth: usize = 0;
+        for c in s.chars() {
+            if c == '(' {
+                paren_depth += 1;
+                cur.push(c);
+            } else if c == ')' {
+                paren_depth = paren_depth.saturating_sub(1);
+                cur.push(c);
+            } else if c.is_whitespace() && paren_depth == 0 {
+                if !cur.is_empty() {
+                    tokens.push(cur);
+                    cur = String::new();
+                }
+            } else {
+                cur.push(c);
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+        tokens
+    }
+
+    fn expand_and_add(&self, name: &str, raw_value: &str, important: bool, out: &mut Vec<Declaration>) {
+        let tokens = Self::split_css_tokens(raw_value);
         if tokens.is_empty() {
             return;
         }
@@ -338,16 +580,17 @@ impl CssParser {
         // Shorthand for margin & padding: 1, 2, 3, or 4 values
         if name == "margin" || name == "padding" {
             let (top, right, bottom, left) = match tokens.len() {
-                1 => (tokens[0], tokens[0], tokens[0], tokens[0]),
-                2 => (tokens[0], tokens[1], tokens[0], tokens[1]),
-                3 => (tokens[0], tokens[1], tokens[2], tokens[1]),
-                _ => (tokens[0], tokens[1], tokens[2], tokens[3]),
+                1 => (&tokens[0], &tokens[0], &tokens[0], &tokens[0]),
+                2 => (&tokens[0], &tokens[1], &tokens[0], &tokens[1]),
+                3 => (&tokens[0], &tokens[1], &tokens[2], &tokens[1]),
+                _ => (&tokens[0], &tokens[1], &tokens[2], &tokens[3]),
             };
             for (side, val) in [("-top", top), ("-right", right), ("-bottom", bottom), ("-left", left)] {
                 if let Some(v) = parse_value_str(val) {
                     out.push(Declaration {
                         name: format!("{}{}", name, side),
                         value: v,
+                        important,
                     });
                 }
             }
@@ -356,7 +599,7 @@ impl CssParser {
 
         // Shorthand for border: e.g. "1px solid #ccc"
         if name == "border" {
-            for token in tokens {
+            for token in &tokens {
                 if let Some(v) = parse_value_str(token) {
                     match &v {
                         Value::Length(..) => {
@@ -364,6 +607,7 @@ impl CssParser {
                                 out.push(Declaration {
                                     name: format!("border-{}-width", side),
                                     value: v.clone(),
+                                    important,
                                 });
                             }
                         }
@@ -372,6 +616,7 @@ impl CssParser {
                                 out.push(Declaration {
                                     name: format!("border-{}-color", side),
                                     value: v.clone(),
+                                    important,
                                 });
                             }
                         }
@@ -380,6 +625,7 @@ impl CssParser {
                                 out.push(Declaration {
                                     name: format!("border-{}-style", side),
                                     value: v.clone(),
+                                    important,
                                 });
                             }
                         }
@@ -390,13 +636,63 @@ impl CssParser {
             return;
         }
 
-        // Shorthand for background: e.g. "#fff"
+        // Shorthand for side borders: border-top, border-bottom, etc.
+        if matches!(name, "border-top" | "border-bottom" | "border-left" | "border-right") {
+            let side = &name["border-".len()..];
+            for token in &tokens {
+                if let Some(v) = parse_value_str(token) {
+                    match &v {
+                        Value::Length(..) => {
+                            out.push(Declaration {
+                                name: format!("border-{}-width", side),
+                                value: v.clone(),
+                                important,
+                            });
+                        }
+                        Value::ColorValue(..) => {
+                            out.push(Declaration {
+                                name: format!("border-{}-color", side),
+                                value: v.clone(),
+                                important,
+                            });
+                        }
+                        Value::Keyword(k) if matches!(k.as_str(), "solid" | "dashed" | "dotted" | "none") => {
+                            out.push(Declaration {
+                                name: format!("border-{}-style", side),
+                                value: v.clone(),
+                                important,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
+
+        // Shorthand for background: e.g. "#fff", "transparent", or "white none repeat"
         if name == "background" {
             if let Some(v) = parse_value_str(raw_value) {
                 out.push(Declaration {
                     name: "background-color".to_string(),
                     value: v,
+                    important,
                 });
+                return;
+            }
+            for token in &tokens {
+                if let Some(v) = parse_value_str(token) {
+                    if matches!(&v, Value::ColorValue(..))
+                        || matches!(&v, Value::Keyword(k) if k == "transparent" || k.starts_with("var("))
+                    {
+                        out.push(Declaration {
+                            name: "background-color".to_string(),
+                            value: v,
+                            important,
+                        });
+                        break;
+                    }
+                }
             }
             return;
         }
@@ -405,6 +701,7 @@ impl CssParser {
             out.push(Declaration {
                 name: name.to_string(),
                 value: v,
+                important,
             });
         }
     }
@@ -461,6 +758,14 @@ impl CssParser {
         }
     }
 
+    fn peek_char(&self, offset: usize) -> char {
+        if self.pos + offset < self.input.len() {
+            self.input[self.pos + offset]
+        } else {
+            '\0'
+        }
+    }
+
     fn consume_char(&mut self) -> char {
         let c = self.curr_char();
         if self.pos < self.input.len() {
@@ -497,6 +802,11 @@ fn is_identifier_char(c: char) -> bool {
 
 pub fn parse_value_str(s: &str) -> Option<Value> {
     let s = s.trim();
+
+    // Preserve CSS variable reference
+    if s.starts_with("var(") && s.ends_with(')') {
+        return Some(Value::Keyword(s.to_string()));
+    }
 
     // Check color: hex or rgb/rgba or named
     if let Some(c) = parse_color(s) {

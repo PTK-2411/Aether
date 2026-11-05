@@ -128,6 +128,7 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
                     bg_color,
                     text_color,
                 });
+                return;
             } else if tag == "input" {
                 let rect = layout_box.dimensions.border_box();
                 let placeholder = styled_node
@@ -145,6 +146,7 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
                     text: value,
                     placeholder,
                 });
+                return;
             }
         }
         BoxType::ImageNode { src, alt, .. } => {
@@ -204,6 +206,9 @@ fn parse_corner_radius(style: &crate::style::StyledNode) -> f32 {
 }
 
 fn get_link_info(styled_node: &crate::style::StyledNode) -> (bool, Option<String>) {
+    if let Some(ref href) = styled_node.link_url {
+        return (true, Some(href.clone()));
+    }
     if styled_node.node.tag_name() == Some("a") {
         if let Some(href) = styled_node.node.get_attribute("href") {
             return (true, Some(href.to_string()));

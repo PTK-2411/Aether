@@ -7,6 +7,8 @@ pub enum Display {
     Inline,
     Block,
     InlineBlock,
+    Flex,
+    Grid,
     None,
 }
 
@@ -15,6 +17,7 @@ pub struct StyledNode<'a> {
     pub node: &'a Node,
     pub specified_values: HashMap<String, Value>,
     pub children: Vec<StyledNode<'a>>,
+    pub link_url: Option<String>,
 }
 
 pub type MatchedRule<'a> = (Specificity, &'a Rule);
@@ -44,11 +47,19 @@ impl<'a> StyledNode<'a> {
             }
         }
 
+        // HTML5 hidden attribute defaults to display: none unless overridden
+        if self.node.get_attribute("hidden").is_some() && self.value("display").is_none() {
+            return Display::None;
+        }
+
         match self.value("display") {
             Some(Value::Keyword(s)) => match s.as_str() {
                 "block" => Display::Block,
                 "none" => Display::None,
                 "inline-block" => Display::InlineBlock,
+                "flex" => Display::Flex,
+                "grid" => Display::Grid,
+                "inline-flex" | "inline-grid" => Display::InlineBlock,
                 _ => Display::Inline,
             },
             _ => {
@@ -158,17 +169,47 @@ fn is_default_block_element(tag: &str) -> bool {
 }
 
 fn is_inheritable(property: &str) -> bool {
-    matches!(
-        property,
-        "color"
-            | "font-size"
-            | "font-weight"
-            | "font-style"
-            | "font-family"
-            | "line-height"
-            | "text-align"
-            | "visibility"
-    )
+    property.starts_with("--")
+        || matches!(
+            property,
+            "color"
+                | "font-size"
+                | "font-weight"
+                | "font-style"
+                | "font-family"
+                | "line-height"
+                | "text-align"
+                | "visibility"
+        )
+}
+
+fn resolve_var_value(val_str: &str, values: &HashMap<String, Value>, depth: usize) -> Option<Value> {
+    if depth > 10 {
+        return None;
+    }
+    let inner = val_str.strip_prefix("var(")?.strip_suffix(')')?.trim();
+    let (var_name, fallback) = if let Some(comma_pos) = inner.find(',') {
+        (inner[..comma_pos].trim(), Some(inner[comma_pos + 1..].trim()))
+    } else {
+        (inner, None)
+    };
+
+    if let Some(v) = values.get(var_name) {
+        match v {
+            Value::Keyword(k) if k.starts_with("var(") && k.ends_with(')') => {
+                resolve_var_value(k, values, depth + 1)
+            }
+            _ => Some(v.clone()),
+        }
+    } else if let Some(fb) = fallback {
+        if fb.starts_with("var(") && fb.ends_with(')') {
+            resolve_var_value(fb, values, depth + 1)
+        } else {
+            crate::css::parse_value_str(fb)
+        }
+    } else {
+        None
+    }
 }
 
 /// Builds a styled tree from a root DOM node, an optional parent hierarchy, and stylesheets.
@@ -186,7 +227,7 @@ fn build_styled_node<'a>(
     stylesheet: &Stylesheet,
     parent_styled: Option<&StyledNode>,
 ) -> StyledNode<'a> {
-    let specified_values = match &node.node_type {
+    let mut specified_values = match &node.node_type {
         NodeType::Element(_) => specified_values(node, ancestors, stylesheet),
         NodeType::Text(_) => {
             // Text nodes inherit typography from parent
@@ -203,6 +244,38 @@ fn build_styled_node<'a>(
         NodeType::Comment(_) => HashMap::new(),
     };
 
+    // Inherit inheritable properties and custom CSS properties (--*) from parent
+    if let Some(parent) = parent_styled {
+        for (prop, val) in &parent.specified_values {
+            if is_inheritable(prop) && !specified_values.contains_key(prop) {
+                specified_values.insert(prop.clone(), val.clone());
+            }
+        }
+    }
+
+    // Resolve any CSS variables (var(--...))
+    let var_keys: Vec<String> = specified_values
+        .iter()
+        .filter_map(|(k, v)| match v {
+            Value::Keyword(s) if s.starts_with("var(") && s.ends_with(')') => Some(k.clone()),
+            _ => None,
+        })
+        .collect();
+
+    for k in var_keys {
+        if let Some(Value::Keyword(raw_var)) = specified_values.get(&k).cloned() {
+            if let Some(resolved) = resolve_var_value(&raw_var, &specified_values, 0) {
+                specified_values.insert(k, resolved);
+            }
+        }
+    }
+
+    let link_url = if node.tag_name() == Some("a") {
+        node.get_attribute("href").map(|s| s.to_string())
+    } else {
+        parent_styled.and_then(|p| p.link_url.clone())
+    };
+
     ancestors.push(node);
 
     // Create current styled node stub for passing as parent to children
@@ -210,6 +283,7 @@ fn build_styled_node<'a>(
         node,
         specified_values: specified_values.clone(),
         children: Vec::new(),
+        link_url: link_url.clone(),
     };
 
     let children = node
@@ -224,6 +298,7 @@ fn build_styled_node<'a>(
         node,
         specified_values,
         children,
+        link_url,
     }
 }
 
@@ -233,6 +308,7 @@ fn specified_values(
     stylesheet: &Stylesheet,
 ) -> HashMap<String, Value> {
     let mut values = HashMap::new();
+    let mut important_keys = std::collections::HashSet::new();
     let mut rules = matching_rules(node, ancestors, stylesheet);
 
     // Sort by specificity: lowest first so higher specificity overrides
@@ -240,7 +316,12 @@ fn specified_values(
 
     for (_, rule) in rules {
         for declaration in &rule.declarations {
-            values.insert(declaration.name.clone(), declaration.value.clone());
+            if declaration.important {
+                values.insert(declaration.name.clone(), declaration.value.clone());
+                important_keys.insert(declaration.name.clone());
+            } else if !important_keys.contains(&declaration.name) {
+                values.insert(declaration.name.clone(), declaration.value.clone());
+            }
         }
     }
 
@@ -250,7 +331,12 @@ fn specified_values(
         let parsed_sheet = CssParser::parse(&dummy_css);
         for rule in parsed_sheet.rules {
             for declaration in rule.declarations {
-                values.insert(declaration.name, declaration.value);
+                if declaration.important || !important_keys.contains(&declaration.name) {
+                    values.insert(declaration.name.clone(), declaration.value);
+                    if declaration.important {
+                        important_keys.insert(declaration.name);
+                    }
+                }
             }
         }
     }
@@ -309,7 +395,7 @@ fn matches_selector(node: &Node, ancestors: &[&Node], selector: &Selector) -> bo
     // The right-most part must match the current node
     match &selector.parts[part_idx] {
         SelectorPart::Simple(simple) => {
-            if !matches_simple_selector(node, simple) {
+            if !matches_simple_selector(node, ancestors, simple) {
                 return false;
             }
         }
@@ -322,6 +408,7 @@ fn matches_selector(node: &Node, ancestors: &[&Node], selector: &Selector) -> bo
 
     // Work backwards through combinators and ancestors
     let mut current_ancestor_idx = ancestors.len();
+    let mut current_node = node;
 
     while part_idx > 0 {
         part_idx -= 1;
@@ -338,21 +425,21 @@ fn matches_selector(node: &Node, ancestors: &[&Node], selector: &Selector) -> bo
 
         match combinator {
             SelectorPart::ChildCombinator => {
-                // Must be immediate parent
                 if current_ancestor_idx == 0 {
                     return false;
                 }
                 current_ancestor_idx -= 1;
-                if !matches_simple_selector(ancestors[current_ancestor_idx], target_simple) {
+                current_node = ancestors[current_ancestor_idx];
+                if !matches_simple_selector(current_node, &ancestors[..current_ancestor_idx], target_simple) {
                     return false;
                 }
             }
             SelectorPart::DescendantCombinator => {
-                // Any ancestor
                 let mut found = false;
                 while current_ancestor_idx > 0 {
                     current_ancestor_idx -= 1;
-                    if matches_simple_selector(ancestors[current_ancestor_idx], target_simple) {
+                    if matches_simple_selector(ancestors[current_ancestor_idx], &ancestors[..current_ancestor_idx], target_simple) {
+                        current_node = ancestors[current_ancestor_idx];
                         found = true;
                         break;
                     }
@@ -361,21 +448,79 @@ fn matches_selector(node: &Node, ancestors: &[&Node], selector: &Selector) -> bo
                     return false;
                 }
             }
-            _ => return false,
+            SelectorPart::AdjacentSiblingCombinator => {
+                let parent = if current_ancestor_idx > 0 {
+                    ancestors[current_ancestor_idx - 1]
+                } else {
+                    return false;
+                };
+                let element_siblings: Vec<&Node> = parent
+                    .children
+                    .iter()
+                    .filter(|c| matches!(c.node_type, NodeType::Element(_)))
+                    .collect();
+                let my_idx = element_siblings
+                    .iter()
+                    .position(|&s| std::ptr::eq(s, current_node));
+                match my_idx {
+                    Some(idx) if idx > 0 => {
+                        let prev_sibling = element_siblings[idx - 1];
+                        if !matches_simple_selector(prev_sibling, &ancestors[..current_ancestor_idx], target_simple) {
+                            return false;
+                        }
+                        current_node = prev_sibling;
+                    }
+                    _ => return false,
+                }
+            }
+            SelectorPart::GeneralSiblingCombinator => {
+                let parent = if current_ancestor_idx > 0 {
+                    ancestors[current_ancestor_idx - 1]
+                } else {
+                    return false;
+                };
+                let element_siblings: Vec<&Node> = parent
+                    .children
+                    .iter()
+                    .filter(|c| matches!(c.node_type, NodeType::Element(_)))
+                    .collect();
+                let my_idx = element_siblings
+                    .iter()
+                    .position(|&s| std::ptr::eq(s, current_node));
+                match my_idx {
+                    Some(idx) if idx > 0 => {
+                        let mut found = false;
+                        for i in (0..idx).rev() {
+                            let prev_sibling = element_siblings[i];
+                            if matches_simple_selector(prev_sibling, &ancestors[..current_ancestor_idx], target_simple) {
+                                current_node = prev_sibling;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            return false;
+                        }
+                    }
+            }
+            SelectorPart::Simple(_) => return false,
         }
     }
 
     true
 }
 
-fn matches_simple_selector(node: &Node, selector: &SimpleSelector) -> bool {
-    if selector.universal {
-        return true;
+fn matches_simple_selector(node: &Node, ancestors: &[&Node], selector: &SimpleSelector) -> bool {
+    // Pseudo-elements (::before, ::after, etc.) never match the DOM element itself
+    if selector.pseudo_element.is_some() {
+        return false;
     }
 
-    if let Some(ref tag) = selector.tag_name {
-        if node.tag_name() != Some(tag) {
-            return false;
+    if !selector.universal {
+        if let Some(ref tag) = selector.tag_name {
+            if node.tag_name() != Some(tag) {
+                return false;
+            }
         }
     }
 
@@ -388,6 +533,116 @@ fn matches_simple_selector(node: &Node, selector: &SimpleSelector) -> bool {
     let node_classes = node.classes();
     for class in &selector.classes {
         if !node_classes.contains(class.as_str()) {
+            return false;
+        }
+    }
+
+    for attr in &selector.attributes {
+        match &attr.op {
+            None => {
+                if node.get_attribute(&attr.name).is_none() {
+                    return false;
+                }
+            }
+            Some(op) => {
+                let node_val = match node.get_attribute(&attr.name) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let expected = attr.value.as_deref().unwrap_or("");
+                let matched = match op.as_str() {
+                    "=" => node_val == expected,
+                    "~=" => node_val.split_whitespace().any(|w| w == expected),
+                    "^=" => !expected.is_empty() && node_val.starts_with(expected),
+                    "$=" => !expected.is_empty() && node_val.ends_with(expected),
+                    "*=" => !expected.is_empty() && node_val.contains(expected),
+                    "|=" => node_val == expected || node_val.starts_with(&format!("{}-", expected)),
+                    _ => false,
+                };
+                if !matched {
+                    return false;
+                }
+            }
+        }
+    }
+
+    for pseudo in &selector.pseudo_classes {
+        match pseudo.as_str() {
+            "root" => {
+                let is_root = node.tag_name() == Some("html") || ancestors.is_empty();
+                if !is_root {
+                    return false;
+                }
+            }
+            "first-child" => {
+                if let Some(parent) = ancestors.last() {
+                    let first_elem = parent.children.iter().find(|c| matches!(c.node_type, NodeType::Element(_)));
+                    if first_elem.map(|e| std::ptr::eq(e, node)) != Some(true) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            "last-child" => {
+                if let Some(parent) = ancestors.last() {
+                    let last_elem = parent.children.iter().rev().find(|c| matches!(c.node_type, NodeType::Element(_)));
+                    if last_elem.map(|e| std::ptr::eq(e, node)) != Some(true) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            "only-child" => {
+                if let Some(parent) = ancestors.last() {
+                    let elem_count = parent.children.iter().filter(|c| matches!(c.node_type, NodeType::Element(_))).count();
+                    if elem_count != 1 {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            "empty" => {
+                let has_elem_children = node.children.iter().any(|c| matches!(c.node_type, NodeType::Element(_)));
+                if has_elem_children || !node.inner_text().trim().is_empty() {
+                    return false;
+                }
+            }
+            "checked" => {
+                if node.get_attribute("checked").is_none() {
+                    return false;
+                }
+            }
+            "disabled" => {
+                if node.get_attribute("disabled").is_none() {
+                    return false;
+                }
+            }
+            "enabled" => {
+                if node.get_attribute("disabled").is_some() {
+                    return false;
+                }
+            }
+            "link" => {
+                if node.tag_name() != Some("a") || node.get_attribute("href").is_none() {
+                    return false;
+                }
+            }
+            "hover" | "active" | "focus" | "focus-visible" | "focus-within" => {
+                // Static page layout does not trigger active focus/hover states
+                return false;
+            }
+            _ => {
+                // Unknown pseudo-class defaults to not matching
+                return false;
+            }
+        }
+    }
+
+    for not_sel in &selector.not_selectors {
+        if matches_simple_selector(node, ancestors, not_sel) {
             return false;
         }
     }
