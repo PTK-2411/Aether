@@ -137,12 +137,56 @@ fn test_layout_box_model_calculation() {
 
 #[test]
 fn test_url_normalization_and_resolution() {
+    // Empty & about: aliases
     assert_eq!(normalize_url(""), "about:newtab");
+    assert_eq!(normalize_url("   "), "about:newtab");
+    assert_eq!(normalize_url("about:welcome"), "about:newtab");
+    assert_eq!(normalize_url("about:home"), "about:newtab");
     assert_eq!(normalize_url("about:test"), "about:test");
-    assert_eq!(normalize_url("example.com"), "https://example.com");
+
+    // Standard schemes preserved verbatim
+    assert_eq!(normalize_url("file:///etc/hosts"), "file:///etc/hosts");
+    assert_eq!(normalize_url("http://example.com"), "http://example.com");
     assert_eq!(normalize_url("https://rust-lang.org"), "https://rust-lang.org");
 
-    // Relative URLs
+    // Localhost routing (http)
+    assert_eq!(normalize_url("localhost"), "http://localhost");
+    assert_eq!(normalize_url("localhost:8080"), "http://localhost:8080");
+    assert_eq!(normalize_url("localhost/dashboard"), "http://localhost/dashboard");
+
+    // Valid domains (https)
+    assert_eq!(normalize_url("example.com"), "https://example.com");
+    assert_eq!(normalize_url("news.ycombinator.com"), "https://news.ycombinator.com");
+    assert_eq!(normalize_url("rust-lang.org/learn"), "https://rust-lang.org/learn");
+    assert_eq!(normalize_url("crates.io:443/crates/url"), "https://crates.io:443/crates/url");
+    assert_eq!(normalize_url("sub-domain.example.co.uk"), "https://sub-domain.example.co.uk");
+
+    // IPv4 addresses (https)
+    assert_eq!(normalize_url("127.0.0.1"), "https://127.0.0.1");
+    assert_eq!(normalize_url("192.168.1.1:8080"), "https://192.168.1.1:8080");
+    assert_eq!(normalize_url("10.0.0.1/admin"), "https://10.0.0.1/admin");
+
+    // Google Search routing for queries, words, phrases, and special characters
+    assert_eq!(normalize_url("rust"), "https://www.google.com/search?q=rust");
+    assert_eq!(
+        normalize_url("rust programming language"),
+        "https://www.google.com/search?q=rust+programming+language"
+    );
+    assert_eq!(
+        normalize_url("c++ & rust"),
+        "https://www.google.com/search?q=c%2B%2B+%26+rust"
+    );
+
+    // Queries with dots/numbers that are NOT valid domains (routed to Google Search)
+    assert_eq!(normalize_url("1.0"), "https://www.google.com/search?q=1.0");
+    assert_eq!(normalize_url("1.2.3"), "https://www.google.com/search?q=1.2.3");
+    assert_eq!(normalize_url("v1.2"), "https://www.google.com/search?q=v1.2");
+    assert_eq!(normalize_url("python3.10"), "https://www.google.com/search?q=python3.10");
+    assert_eq!(normalize_url("hello..."), "https://www.google.com/search?q=hello...");
+    assert_eq!(normalize_url("..."), "https://www.google.com/search?q=...");
+    assert_eq!(normalize_url(".bashrc"), "https://www.google.com/search?q=.bashrc");
+
+    // Relative URLs resolution
     let base = "https://example.com/blog/article.html";
     assert_eq!(resolve_relative_url(base, "about:newtab"), "about:newtab");
     assert_eq!(resolve_relative_url(base, "next.html"), "https://example.com/blog/next.html");

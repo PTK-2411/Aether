@@ -1129,69 +1129,13 @@ impl BrowserApp {
                     self.render_search_suggestions_dropdown(ui, search_rect, false);
                 }
 
-                ui.add_space(18.0);
-
-                // 3. Two Suggestion Action Chips (Cards underneath search bar)
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-
-                    // Calculate centering offset
-                    let total_chips_w = 440.0;
-                    let left_pad = ((ui.available_width() - total_chips_w) / 2.0).max(0.0);
-                    ui.add_space(left_pad);
-
-                    // Chip 1: "Aether AI Assistant"
-                    let chip1 = Frame::NONE
-                        .fill(Color32::from_rgb(48, 50, 54))
-                        .corner_radius(16)
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(60, 64, 67)))
-                        .inner_margin(egui::Margin::symmetric(14, 10))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (star_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::hover());
-                                draw_sparkle_icon(ui.painter(), star_rect.center(), 7.0, Color32::from_rgb(168, 199, 250));
-                                ui.add_space(4.0);
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new("Aether AI Assistant").size(12.0).strong().color(Color32::WHITE));
-                                    ui.label(RichText::new("Instant search, summaries & intelligence").size(10.0).color(Color32::from_rgb(154, 160, 166)));
-                                });
-                            });
-                        });
-
-                    if chip1.response.interact(egui::Sense::click()).clicked() {
-                        self.navigate_active_tab("about:ai");
-                    }
-
-                    // Chip 2: "Explore Open Web"
-                    let chip2 = Frame::NONE
-                        .fill(Color32::from_rgb(48, 50, 54))
-                        .corner_radius(16)
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(60, 64, 67)))
-                        .inner_margin(egui::Margin::symmetric(14, 10))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (cam_chip, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), egui::Sense::hover());
-                                draw_camera_icon(ui.painter(), cam_chip.center(), 6.0, Color32::from_rgb(241, 180, 70));
-                                ui.add_space(4.0);
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new("Explore Open Web").size(12.0).strong().color(Color32::WHITE));
-                                    ui.label(RichText::new("Acid test suite & layout verification").size(10.0).color(Color32::from_rgb(154, 160, 166)));
-                                });
-                            });
-                        });
-
-                    if chip2.response.interact(egui::Sense::click()).clicked() {
-                        self.navigate_active_tab("about:test");
-                    }
-                });
-
                 ui.add_space(28.0);
 
                 // 4. Quick Shortcut Icons (Row of circles with vector graphics)
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 24.0;
 
-                    let total_shortcuts_w = 7.0 * 68.0;
+                    let total_shortcuts_w = 6.0 * 68.0;
                     let pad_shortcuts = ((ui.available_width() - total_shortcuts_w) / 2.0).max(0.0);
                     ui.add_space(pad_shortcuts);
 
@@ -1231,16 +1175,7 @@ impl BrowserApp {
                         || self.navigate_active_tab("https://www.rust-lang.org"),
                     );
 
-                    // 5. Aether AI
-                    render_vector_shortcut(
-                        ui,
-                        VectorIcon::Sparkle,
-                        Color32::from_rgb(66, 133, 244),
-                        "Aether AI",
-                        || self.navigate_active_tab("about:ai"),
-                    );
-
-                    // 6. Reddit
+                    // 5. Reddit
                     render_vector_shortcut(
                         ui,
                         VectorIcon::Letter("r/"),
@@ -1249,7 +1184,7 @@ impl BrowserApp {
                         || self.navigate_active_tab("https://reddit.com"),
                     );
 
-                    // 7. DuckDuckGo
+                    // 6. DuckDuckGo
                     render_vector_shortcut(
                         ui,
                         VectorIcon::Letter("D"),
