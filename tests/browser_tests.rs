@@ -137,14 +137,14 @@ fn test_layout_box_model_calculation() {
 
 #[test]
 fn test_url_normalization_and_resolution() {
-    assert_eq!(normalize_url(""), "about:welcome");
+    assert_eq!(normalize_url(""), "about:newtab");
     assert_eq!(normalize_url("about:test"), "about:test");
     assert_eq!(normalize_url("example.com"), "https://example.com");
     assert_eq!(normalize_url("https://rust-lang.org"), "https://rust-lang.org");
 
     // Relative URLs
     let base = "https://example.com/blog/article.html";
-    assert_eq!(resolve_relative_url(base, "about:welcome"), "about:welcome");
+    assert_eq!(resolve_relative_url(base, "about:newtab"), "about:newtab");
     assert_eq!(resolve_relative_url(base, "next.html"), "https://example.com/blog/next.html");
     assert_eq!(resolve_relative_url(base, "/images/logo.png"), "https://example.com/images/logo.png");
 }

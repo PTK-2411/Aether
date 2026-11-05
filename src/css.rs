@@ -76,6 +76,8 @@ pub enum Unit {
     Rem,
     Percent,
     Pt,
+    Vh,
+    Vw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,6 +534,10 @@ fn parse_length(s: &str) -> Option<Value> {
         (n, Unit::Percent)
     } else if let Some(n) = s_lower.strip_suffix("pt") {
         (n, Unit::Pt)
+    } else if let Some(n) = s_lower.strip_suffix("vh") {
+        (n, Unit::Vh)
+    } else if let Some(n) = s_lower.strip_suffix("vw") {
+        (n, Unit::Vw)
     } else {
         return None;
     };

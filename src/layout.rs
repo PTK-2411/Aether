@@ -140,6 +140,8 @@ impl<'a> LayoutBox<'a> {
                 Value::Length(em, Unit::Em) => *em * 16.0,
                 Value::Length(rem, Unit::Rem) => *rem * 16.0,
                 Value::Length(pct, Unit::Percent) => base * (*pct / 100.0),
+                Value::Length(vh, Unit::Vh) => 600.0 * (*vh / 100.0),
+                Value::Length(vw, Unit::Vw) => base * (*vw / 100.0),
                 Value::Number(n) => *n,
                 _ => 0.0,
             }
@@ -222,6 +224,8 @@ impl<'a> LayoutBox<'a> {
                 Value::Length(pt, Unit::Pt) => *pt * 1.333,
                 Value::Length(em, Unit::Em) => *em * 16.0,
                 Value::Length(rem, Unit::Rem) => *rem * 16.0,
+                Value::Length(vh, Unit::Vh) => 600.0 * (*vh / 100.0),
+                Value::Length(pct, Unit::Percent) => 600.0 * (*pct / 100.0),
                 Value::Number(n) => *n,
                 _ => 0.0,
             }

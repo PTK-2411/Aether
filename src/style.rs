@@ -25,6 +25,12 @@ impl<'a> StyledNode<'a> {
     }
 
     pub fn display(&self) -> Display {
+        if let Some(tag) = self.node.tag_name() {
+            if tag == "html" || tag == "body" {
+                return Display::Block;
+            }
+        }
+
         match self.value("display") {
             Some(Value::Keyword(s)) => match s.as_str() {
                 "block" => Display::Block,

@@ -2815,6 +2815,7 @@ dependencies = [
  "eframe",
  "image",
  "reqwest",
+ "serde_json",
  "url",
 ]
 
